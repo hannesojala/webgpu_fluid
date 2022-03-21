@@ -1,6 +1,6 @@
 use std::{slice, mem};
 
-use wgpu::{Backends, Device, DeviceDescriptor, Features, Instance, Limits, PowerPreference, Queue, RequestAdapterOptions, Surface, SurfaceConfiguration, PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, util::{DeviceExt, BufferInitDescriptor}, BufferSlice};
+use wgpu::{Backends, Device, DeviceDescriptor, Features, Instance, Limits, PowerPreference, Queue, RequestAdapterOptions, Surface, SurfaceConfiguration, PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, util::{DeviceExt, BufferInitDescriptor}, BufferSlice, Texture, TextureDescriptor, TextureUsages};
 use winit::{dpi::PhysicalSize, event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent}, event_loop::{ControlFlow, EventLoop}, window::Window};
 
 struct App {
@@ -12,17 +12,24 @@ struct App {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    texture:    Texture,
+    texture_view: wgpu::TextureView,
+    texture_sampler: wgpu::Sampler,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    texture_size: wgpu::Extent3d,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct Vertex {
     position: [f32; 3],
+    tex_coords: [f32; 2],
 }
 
 impl Vertex {
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<Self>() as wgpu::BufferAddress,
@@ -34,10 +41,10 @@ impl Vertex {
 
 
 const VERTICES: &[Vertex] = &[
-    Vertex { position: [1.0, 1.0, 0.0] },
-    Vertex { position: [-1., 1.0, 0.0] },
-    Vertex { position: [-1., -1., 0.0] },
-    Vertex { position: [1.0, -1., 0.0] },
+    Vertex { position: [1.0, 1.0, 0.0], tex_coords: [1.0, 0.0] },
+    Vertex { position: [-1., 1.0, 0.0], tex_coords: [0.0, 0.0] },
+    Vertex { position: [-1., -1., 0.0], tex_coords: [0.0, 1.0] },
+    Vertex { position: [1.0, -1., 0.0], tex_coords: [1.0, 1.0] },
 ];
 
 const INDICES: &[u32] = &[
@@ -61,7 +68,7 @@ impl App {
         }, None)).expect("Failed to obtain device: ");
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
             format: surface.get_preferred_format(&adapter).unwrap(),
             width: size.width,
             height: size.height,
@@ -71,11 +78,109 @@ impl App {
             label: Some("ShaderModule"),
             source: ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+        surface.configure(&device, &config);
+        let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor{
+            label: Some("Vertex Buffer"),
+            contents: slice_to_u8_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&BufferInitDescriptor{
+            label: Some("Index Buffer"),
+            contents: slice_to_u8_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let texture_size = wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 };
+        let texture_format = surface.get_preferred_format(&adapter).unwrap();
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("Texture"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: texture_format,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        });
+        let mut texture_data = vec![255_u8; (config.width*4*config.height) as usize]; // white
+        // Every 4th column black
+        texture_data.chunks_mut(4).step_by(4).for_each(|p| { p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0; } );
+        queue.write_texture(
+            // Tells wgpu where to copy the pixel data
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            // The actual pixel data
+            &texture_data,
+            // The layout of the texture
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(4 * config.width),
+                rows_per_image: std::num::NonZeroU32::new(config.height),
+            },
+            texture_size,
+        );
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let texture_bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(
+                            // SamplerBindingType::Comparison is only for TextureSampleType::Depth
+                            // SamplerBindingType::Filtering if the sample_type of the texture is:
+                            //     TextureSampleType::Float { filterable: true }
+                            // Otherwise you'll get an error.
+                            wgpu::SamplerBindingType::Filtering,
+                        ),
+                        count: None,
+                    },
+                ],
+                label: Some("texture_bind_group_layout"),
+            }
+        );        
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                    }
+                ],
+                label: Some("bind_group"),
+            }
+        );
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor { 
             label: Some("Render Pipeline"),
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("Pipeline Layout Descriptor"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
             })),
             vertex: VertexState {
@@ -112,19 +217,10 @@ impl App {
             },
             multiview: None, // 5.
         });
-        surface.configure(&device, &config);
-        let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor{
-            label: Some("Vertex Buffer"),
-            contents: slice_to_u8_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&BufferInitDescriptor{
-            label: Some("Index Buffer"),
-            contents: slice_to_u8_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
         App {
-            surface, device, queue, config, size, render_pipeline, vertex_buffer, index_buffer
+            surface, device, queue, config, size, 
+            render_pipeline, vertex_buffer, index_buffer, 
+            texture, texture_view, texture_sampler, texture_bind_group_layout, bind_group, texture_size
         }
     }
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -166,11 +262,17 @@ impl App {
             });
             // Set pipeline to use
             render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
             // Draw Command: Vertices and instances
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..6, 0, 0..1);
         }
+        encoder.copy_texture_to_texture(
+            swapchain_texture.texture.as_image_copy(), 
+            self.texture.as_image_copy(), 
+            self.texture_size
+        );
         // submit iterator of command buffers and present
         self.queue.submit(std::iter::once(encoder.finish()));
         swapchain_texture.present();
