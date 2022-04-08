@@ -31,8 +31,8 @@ use winit::{
 
 const SIMULATION_SIZE: usize = 1024;
 const WORK_GROUP_DIMENSIONS: u32 = 32; // x and y
-const TIMESTEP_SECONDS: f32 = 1.0 / 144.;
-const GAUSSS_QUAL: u32 = 25;
+const TIMESTEP_SECONDS: f32 = 1.0 / 240.;
+const GAUSSS_QUAL: u32 = 4;
 
 #[repr(C)]
 struct PushContants {
@@ -54,15 +54,28 @@ struct SimTime {
     accum_time: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct MouseState {
+    position: (f64, f64),
+    b1_down: bool,
+}
+
+impl MouseState {
+    fn new() -> Self {
+        Self {
+            position: (0., 0.),
+            b1_down: false,
+        }
+    }
+}
+
 struct App {
-    surface: Surface,                     // Window surface to render to
-    surface_config: SurfaceConfiguration, // Configuration of the surface (Format, Dimensions, etc.)
-    device: Device,                       // WebGPU Device (GPU)
-    queue: Queue,                         // Queue which executes submitted CommandBuffers
-    render_pipeline: RenderPipeline, // The RenderPipeline with its bindings, buffers, and targets
-    vertex_buffer: Buffer,           // Buffer of vertices to be drawn
-    index_buffer: Buffer,            // Buffer of indices to be drawn
-    texture_bind_group: BindGroup,   // Represents texture resources used by RenderPass
+    surface: Surface,                       // Window surface to render to
+    surface_config: SurfaceConfiguration,   // Configuration of the surface (Format, Dimensions, etc.)
+    device: Device,                         // WebGPU Device
+    queue: Queue,                           // Queue which executes submitted CommandBuffers
+    vertex_buffer: Buffer,                  // Buffer of vertices to be drawn
+    index_buffer: Buffer,                   // Buffer of indices to be drawn
     compute_bind_group: BindGroup,
     input_compute_pipeline: ComputePipeline,
     advect_compute_pipeline: ComputePipeline,
@@ -70,16 +83,16 @@ struct App {
     rem_div_compute_pipeline: ComputePipeline,
     confine_vort_compute_pipeline: ComputePipeline,
     vel_buff: Buffer,
-    texture_layout: ImageDataLayout,
-    texture: wgpu::Texture,
-    texture_size: wgpu::Extent3d,
-    mouse_position: (f64, f64),
-    mouse_delta: (f32, f32),
-    mouse_b1down: bool,
-    sim_time: SimTime,
     temp_buff_0: Buffer,
     temp_buff_1: Buffer,
-    temp_buff_size: usize,
+    texture_layout: ImageDataLayout,
+    texture_size: wgpu::Extent3d,
+    vel_texture: wgpu::Texture,
+    vel_texture_bind_group: BindGroup,      // Represents texture resources used by RenderPass
+    vel_render_pipeline: RenderPipeline,
+    mouse_state: MouseState,
+    mouse_state_prev: MouseState,
+    sim_time: SimTime,
 }
 
 impl App {
@@ -170,8 +183,8 @@ impl App {
             height: SIMULATION_SIZE as u32,
             depth_or_array_layers: 1,
         };
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("vTexture"),
+        let vel_texture = device.create_texture(&TextureDescriptor {
+            label: Some("velTexture"),
             size: texture_size,
             mip_level_count: 1,
             sample_count: 1,
@@ -180,31 +193,31 @@ impl App {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         });
         // Dummy texture data
-        let gorilla = image::open("./gorilla.png")
-            .unwrap()
-            .resize_exact(
-                texture_size.width,
-                texture_size.height,
-                image::imageops::FilterType::Nearest,
-            )
-            .into_rgba32f();
+        // let gorilla = image::open("./gorilla.png")
+        //     .unwrap()
+        //     .resize_exact(
+        //         texture_size.width,
+        //         texture_size.height,
+        //         image::imageops::FilterType::Nearest,
+        //     )
+        //     .into_rgba32f();
         // Enqueue a texture write
         let texture_layout = wgpu::ImageDataLayout {
             offset: 0,
             bytes_per_row: NonZeroU32::new(mem::size_of::<Cell>() as u32 * texture_size.width),
             rows_per_image: NonZeroU32::new(texture_size.height),
         };
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            gorilla.as_bytes(),
-            texture_layout,
-            texture_size,
-        );
+        // queue.write_texture(
+        //     wgpu::ImageCopyTexture {
+        //         texture: &dye_texture,
+        //         mip_level: 0,
+        //         origin: wgpu::Origin3d::ZERO,
+        //         aspect: wgpu::TextureAspect::All,
+        //     },
+        //     gorilla.as_bytes(),
+        //     texture_layout,
+        //     texture_size,
+        // );
         // Create texture samplers
         let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -361,13 +374,13 @@ impl App {
                 label: Some("texture_bind_group_layout"),
             });
         // Create bind group describing a specific texture and sampler in the layout described
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let vel_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                        &vel_texture.create_view(&wgpu::TextureViewDescriptor::default()),
                     ),
                 },
                 wgpu::BindGroupEntry {
@@ -378,7 +391,7 @@ impl App {
             label: Some("bind_group"),
         });
         // Create render pipeline
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let vel_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             // Provide the layouts this pipeline will require
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -430,21 +443,19 @@ impl App {
             vel_buff,
             temp_buff_0,
             temp_buff_1,
-            temp_buff_size: temp_buffer_bytes.len(),
-            texture,
+            vel_texture,
             texture_size,
             texture_layout,
-            texture_bind_group,
-            render_pipeline,
+            vel_texture_bind_group,
+            vel_render_pipeline,
             compute_bind_group,
             input_compute_pipeline,
             advect_compute_pipeline,
             gausss_iter_compute_pipeline,
             rem_div_compute_pipeline,
             confine_vort_compute_pipeline,
-            mouse_position: (0., 0.),
-            mouse_delta: (0., 0.),
-            mouse_b1down: false,
+            mouse_state: MouseState::new(),
+            mouse_state_prev: MouseState::new(),
             sim_time: SimTime {
                 timestep: Duration::from_secs_f32(TIMESTEP_SECONDS),
                 current_time: Instant::now(),
@@ -473,8 +484,8 @@ impl App {
             }],
             depth_stencil_attachment: None,
         });
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
+        render_pass.set_pipeline(&self.vel_render_pipeline);
+        render_pass.set_bind_group(0, &self.vel_texture_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
         render_pass.draw_indexed(0..6, 0, 0..1);
@@ -504,19 +515,26 @@ impl App {
         swapchain_texture.present();
     }
 
+    fn mouse_delta(&self) -> (f32,f32) {
+        (
+            (self.mouse_state.position.0 - self.mouse_state_prev.position.0) as f32,
+            (self.mouse_state.position.1 - self.mouse_state_prev.position.1) as f32,
+        )
+    }
+
     fn get_push_consts(&self) -> PushContants {
         // Convert the mouse window coordinates to simulation coordinates
         let force_pos = (
-            self.mouse_position.0 as i32 * SIMULATION_SIZE as i32
+            self.mouse_state.position.0 as i32 * SIMULATION_SIZE as i32
                 / self.surface_config.width as i32,
-            self.mouse_position.1 as i32 * SIMULATION_SIZE as i32
+            self.mouse_state.position.1 as i32 * SIMULATION_SIZE as i32
                 / self.surface_config.height as i32,
         );
         PushContants {
             dimension: (SIMULATION_SIZE as u32, SIMULATION_SIZE as u32),
             force_pos,
-            force_dir: self.mouse_delta,
-            pressed: self.mouse_b1down as i32,
+            force_dir: self.mouse_delta(),
+            pressed: self.mouse_state.b1_down as i32,
             dt_s: self.sim_time.timestep.as_secs_f32(),
         }
     }
@@ -542,6 +560,12 @@ impl App {
             compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            // Pass: Confine Vorticity
+            compute_pass.set_pipeline(&self.confine_vort_compute_pipeline);
+            let push_consts = self.get_push_consts();
+            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Gauss-Seidel iteration
             for _ in 0..GAUSSS_QUAL {
                 compute_pass.set_pipeline(&self.gausss_iter_compute_pipeline);
@@ -552,12 +576,6 @@ impl App {
             }
             // Pass: Remove divergence
             compute_pass.set_pipeline(&self.rem_div_compute_pipeline);
-            let push_consts = self.get_push_consts();
-            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
-            // Pass: Confine Vorticity
-            compute_pass.set_pipeline(&self.confine_vort_compute_pipeline);
             let push_consts = self.get_push_consts();
             compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
@@ -589,13 +607,14 @@ impl App {
                 layout: self.texture_layout,
             },
             ImageCopyTexture {
-                texture: &self.texture,
+                texture: &self.vel_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             self.texture_size,
         );
+
         self.queue.submit([encoder.finish()]);
     }
 
@@ -634,17 +653,11 @@ impl App {
             } => return ControlFlow::Exit,
             WindowEvent::Resized(size) => self.resize_surface(*size),
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_delta = (
-                    (position.x - self.mouse_position.0) as f32,
-                    (position.y - self.mouse_position.1) as f32,
-                );
-                if self.mouse_b1down == false {
-                    self.mouse_position = (position.x, position.y);
-                }
+                self.mouse_state.position = (position.x, position.y);
             }
             WindowEvent::MouseInput { button, state, .. } => match button {
                 winit::event::MouseButton::Left => {
-                    self.mouse_b1down = match state {
+                    self.mouse_state.b1_down = match state {
                         ElementState::Pressed => true,
                         ElementState::Released => false,
                     }
@@ -660,6 +673,7 @@ impl App {
         let timesteps = self.perf();
         self.update(timesteps);
         self.render();
+        self.mouse_state_prev = self.mouse_state;
     }
 }
 

@@ -22,12 +22,12 @@ fn vs_main(
 
 // Fragment shader
 
-[[group(0), binding(0)]] var tex: texture_2d<f32>;
+[[group(0), binding(0)]] var vel_tex: texture_2d<f32>;
 [[group(0), binding(1)]] var samp: sampler;
 
 [[stage(fragment)]]
 fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
-    var out = abs(textureSample(tex, samp, in.tex_coord));
+    var out = abs(textureSample(vel_tex, samp, in.tex_coord));
     return out;
 }
 

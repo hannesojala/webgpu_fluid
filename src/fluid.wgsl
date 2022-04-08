@@ -62,6 +62,18 @@ fn add_input(coords: vec2<u32>) {
     set_vel(coords, new);
 }
 
+[[stage(compute), workgroup_size(32,32)]]
+fn input_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
+    let coords = GlobalInvocationID.xy;
+    let size = (pc.dimension);
+    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+        // add input forces
+        add_input(coords);
+    } else {
+        bound(coords);
+    }
+}
+
 fn advect(coords: vec2<u32>) {
     let size = vec2<f32>(pc.dimension);
     let dt = pc.dt_s;
@@ -81,18 +93,6 @@ fn advect(coords: vec2<u32>) {
     // blerp
     let blerped = blerp(s0,s1,s2,s3,fract);
     set_vel(coords, blerped);
-}
-
-[[stage(compute), workgroup_size(32,32)]]
-fn input_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        // add input forces
-        add_input(coords);
-    } else {
-        bound(coords);
-    }
 }
 
 [[stage(compute), workgroup_size(32,32)]]
@@ -169,19 +169,25 @@ fn rem_div_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>
 }
 
 fn vel_curl_at(coords: vec2<u32>) -> f32 {
-    let curl = (vel_at(coords + vec2<u32>(0u,1u)).x - vel_at(coords - vec2<u32>(0u,1u)).x) 
-        - (vel_at(coords + vec2<u32>(1u,0u)).y - vel_at(coords - vec2<u32>(1u,0u)).y);
+    let curl =
+        vel_at(coords + vec2<u32>(0u,1u)).x
+        - vel_at(coords - vec2<u32>(0u,1u)).x
+        + vel_at(coords - vec2<u32>(1u,0u)).y
+        - vel_at(coords + vec2<u32>(1u,0u)).y; // watch the signs!
     return curl;
 }
 
 fn confine_vort(coords: vec2<u32>) {
     let dt = pc.dt_s;
-    let v = 15.0;
-    let vort_grad = normalize(vec2<f32>(
+    var v = 2.0;
+    let vort_grad = vec2<f32>(
         abs(vel_curl_at(coords - vec2<u32>(0u,1u))) - abs(vel_curl_at(coords + vec2<u32>(0u,1u))),
-        abs(vel_curl_at(coords - vec2<u32>(1u,0u))) - abs(vel_curl_at(coords + vec2<u32>(1u,0u)))
-    ));
-    let adjusted = vel_at(coords) + (dt * v * vort_grad * vel_curl_at(coords));
+        abs(vel_curl_at(coords + vec2<u32>(1u,0u))) - abs(vel_curl_at(coords - vec2<u32>(1u,0u)))
+    );
+    let len = max(sqrt(vort_grad.x * vort_grad.x + vort_grad.y * vort_grad.y), 0.00000001);
+    let vort_grad_norm = vort_grad / len;
+    let adjustment = vel_at(coords) + (dt * v * vel_curl_at(coords) * vort_grad_norm);
+    set_vel(coords, adjustment);
 }
 
 [[stage(compute), workgroup_size(32,32)]]
