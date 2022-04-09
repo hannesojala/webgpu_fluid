@@ -39,26 +39,36 @@ fn blerp(v1: vec2<f32>, v2: vec2<f32>, v3: vec2<f32>, v4: vec2<f32>, k: vec2<f32
 
 fn bound(coords: vec2<u32>) {
     let size = vec2<u32>(pc.dimension);
+    let m = size.x - 1u;
+    let n = size.x - 1u;
+    // TODO: exclude corners
     if (coords.x == 0u) {
         set_vel(coords, -1.0 * vel_at(vec2<u32>(1u, coords.y)));
     }
-    if (coords.x == size.x - 1u) {
-        set_vel(coords, -1.0 * vel_at(vec2<u32>(size.x - 2u, coords.y)));
+    if (coords.x == m) {
+        set_vel(coords, -1.0 * vel_at(vec2<u32>(m - 1u, coords.y)));
     }
     if (coords.y == 0u) {
         set_vel(coords, -1.0 * vel_at(vec2<u32>(coords.x, 1u)));
     }
-    if (coords.y == size.y - 1u) {
-        set_vel(coords, -1.0 * vel_at(vec2<u32>(coords.x, size.y - 2u)));
-    } 
+    if (coords.y == n) {
+        set_vel(coords, -1.0 * vel_at(vec2<u32>(coords.x, n - 1u)));
+    }
+    if ((coords.x == 0u && coords.y == 0u) ||
+        (coords.x == 0u && coords.y ==  n) ||
+        (coords.x ==  m && coords.y == 0u) ||
+        (coords.x ==  m && coords.y ==  n)) {
+        set_vel(coords, vec2<f32>(0.0,0.0));
+    }
 }
 
 fn add_input(coords: vec2<u32>) {
     let dt = pc.dt_s;
     let size = vec2<f32>(pc.dimension);
+    let range = (size.x + size.y) / 2.0;
     let dist = distance(vec2<f32>(coords), vec2<f32>(pc.force_pos));
-    let do_draw = f32(pc.pressed == 1) * f32(dist < 16.0);   // TODO: draw size push const
-    let new = vel_at(coords) + (do_draw * dt * pc.force_dir);
+    let do_draw = f32(pc.pressed == 1) * f32(dist < range);   // TODO: draw size push const
+    let new = vel_at(coords) + ((do_draw * dt * (range/pow(dist+1.0,2.0))) * pc.force_dir);
     set_vel(coords, new);
 }
 
@@ -184,7 +194,7 @@ fn confine_vort(coords: vec2<u32>) {
         abs(vel_curl_at(coords - vec2<u32>(0u,1u))) - abs(vel_curl_at(coords + vec2<u32>(0u,1u))),
         abs(vel_curl_at(coords + vec2<u32>(1u,0u))) - abs(vel_curl_at(coords - vec2<u32>(1u,0u)))
     );
-    let len = max(sqrt(vort_grad.x * vort_grad.x + vort_grad.y * vort_grad.y), 0.00000001);
+    let len = max(sqrt(vort_grad.x * vort_grad.x + vort_grad.y * vort_grad.y), 0.00001);
     let vort_grad_norm = vort_grad / len;
     let adjustment = vel_at(coords) + (dt * v * vel_curl_at(coords) * vort_grad_norm);
     set_vel(coords, adjustment);

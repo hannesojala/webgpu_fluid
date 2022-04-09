@@ -29,10 +29,10 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const SIMULATION_SIZE: usize = 1024;
+const SIMULATION_SIZE: usize = 512;
 const WORK_GROUP_DIMENSIONS: u32 = 32; // x and y
-const TIMESTEP_SECONDS: f32 = 1.0 / 240.;
-const GAUSSS_QUAL: u32 = 4;
+const TIMESTEP_SECONDS: f32 = 1.0 / 100.;
+const GAUSSS_QUAL: u32 = 100;
 
 #[repr(C)]
 struct PushContants {
@@ -546,6 +546,8 @@ impl App {
         );
 
         // Zero temp buffers
+        // Comment out for buggy fake pressure (look at the compressible continuity eq for an idea why this works?)
+        // todo: 
         encoder.clear_buffer(&self.temp_buff_0, 0, None);
         encoder.clear_buffer(&self.temp_buff_1, 0, None);
 
