@@ -29,10 +29,8 @@ fn vs_main(
 fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
     let vel = textureSample(vel_tex, samp, in.tex_coord);
     let r  = abs(clamp(vel.x,  0.0, 1.0));
-    let g1 = abs(clamp(vel.x, -1.0, 0.0));
-    let g2 = abs(clamp(vel.y,  0.0, 1.0));
+    let g = (abs(clamp(vel.x, -1.0, 0.0)) + abs(clamp(vel.y,  0.0, 1.0))) / 2.0;
     let b  = abs(clamp(vel.y, -1.0, 0.0));
-    let g  = (g1+g2)/2.0;
     return vec4<f32>(r,g,b, 1.0);
 }
 

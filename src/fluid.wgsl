@@ -1,13 +1,3 @@
-struct PushConstants {
-    dimension: vec2<u32>;
-    force_pos: vec2<i32>;
-    force_dir: vec2<f32>;
-    pressed: i32;
-    dt_s: f32;
-};
-
-var<push_constant> pc: PushConstants;
-
 struct Velocity {
     data: array<vec4<f32>>;
 };
@@ -16,9 +6,20 @@ struct FloatArr {
     data: array<f32>;
 };
 
+struct PushConstants {
+    dimension: vec2<u32>;
+    force_pos: vec2<i32>;
+    force_dir: vec2<f32>;
+    pressed: i32;
+    dt_s: f32;
+    stage: u32;
+};
+
 [[group(0), binding(0)]] var<storage, read_write> velocity: Velocity;
 [[group(0), binding(1)]] var<storage, read_write> temp1: FloatArr;
 [[group(0), binding(2)]] var<storage, read_write> temp2: FloatArr;
+
+var<push_constant> pc: PushConstants;
 
 fn idx(coords: vec2<u32>) -> u32 {
     return coords.x + u32(pc.dimension.x) * coords.y;
@@ -37,11 +38,11 @@ fn blerp(v1: vec2<f32>, v2: vec2<f32>, v3: vec2<f32>, v4: vec2<f32>, k: vec2<f32
     return mix(mix(v1, v2, k.x), mix(v3, v4, k.x), k.y);
 }
 
+// TODO: this is alllll wrong
 fn bound(coords: vec2<u32>) {
     let size = vec2<u32>(pc.dimension);
     let m = size.x - 1u;
     let n = size.x - 1u;
-    // TODO: exclude corners
     if (coords.x == 0u) {
         set_vel(coords, -1.0 * vel_at(vec2<u32>(1u, coords.y)));
     }
@@ -72,15 +73,12 @@ fn add_input(coords: vec2<u32>) {
     set_vel(coords, new);
 }
 
-[[stage(compute), workgroup_size(32,32)]]
 fn input_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
     let size = (pc.dimension);
     if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
         // add input forces
         add_input(coords);
-    } else {
-        bound(coords);
     }
 }
 
@@ -95,25 +93,21 @@ fn advect(coords: vec2<u32>) {
     );
     // sample
     let whole = vec2<u32>(floor(pos_0)); // floor rounding?
-    let fract = fract(pos_0);
     let s0 = vel_at(whole);
     let s1 = vel_at(whole + vec2<u32>(1u, 0u));
     let s2 = vel_at(whole + vec2<u32>(0u, 1u));
     let s3 = vel_at(whole + vec2<u32>(1u, 1u));
     // blerp
-    let blerped = blerp(s0,s1,s2,s3,fract);
+    let blerped = blerp(s0,s1,s2,s3,fract(pos_0));
     set_vel(coords, blerped);
 }
 
-[[stage(compute), workgroup_size(32,32)]]
 fn advect_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
     let size = (pc.dimension);
     if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
         // advect
         advect(coords);
-    } else {
-        bound(coords);
     }
 }
 
@@ -128,30 +122,23 @@ fn get_div(coords: vec2<u32>) -> f32 {
 
 fn gausss(coords: vec2<u32>) {
     let div = get_div(coords);
-    // TODO: check red black iteration to prevent data race
-    // swap ptrs
-    let temp = temp1.data[idx(coords)];
-    temp1.data[idx(coords)] = temp2.data[idx(coords)];
-    temp2.data[idx(coords)] = temp;
+    // TODO: Swap buffers outside
+    // TODO: data race? (probably just makes it converge more slowly?)
+    temp2.data[idx(coords)] = temp1.data[idx(coords)];
     // do mafs
     let u = temp2.data[idx(coords - vec2<u32>(0u, 1u))];
     let d = temp2.data[idx(coords + vec2<u32>(0u, 1u))];
     let l = temp2.data[idx(coords - vec2<u32>(1u, 0u))];
     let r = temp2.data[idx(coords + vec2<u32>(1u, 0u))];
     temp1.data[idx(coords)] = (div + u + d + l + r) / 4.0;
-    // todo: bound?
     // div_sol now in temp1.data
 }
 
-[[stage(compute), workgroup_size(32,32)]]
 fn gauss_it_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
     let size = (pc.dimension);
     if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        // get div, gauss seidel, and remove it
         gausss(coords);
-    } else {
-        bound(coords);
     }
 }
 
@@ -167,14 +154,11 @@ fn rem_div(coords: vec2<u32>) {
     set_vel(coords, divless);
 }
 
-[[stage(compute), workgroup_size(32,32)]]
 fn rem_div_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
     let size = (pc.dimension);
     if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
         rem_div(coords);
-    } else {
-        bound(coords);
     }
 }
 
@@ -200,14 +184,31 @@ fn confine_vort(coords: vec2<u32>) {
     set_vel(coords, adjustment);
 }
 
-[[stage(compute), workgroup_size(32,32)]]
 fn confine_vort_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
     let size = (pc.dimension);
     // note smaller bounds
     if (coords.x > 1u && coords.x < (size.x - 2u) && coords.y > 1u && coords.y < (size.y - 2u)) {
         confine_vort(coords);
-    } else {
-        // nothing
     }
+}
+
+[[stage(compute), workgroup_size(32,32)]]
+fn main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
+    if (pc.stage == 0u) {
+        advect_main(GlobalInvocationID);
+    }
+    else if (pc.stage == 1u) {
+        confine_vort_main(GlobalInvocationID);
+    }
+    else if (pc.stage == 2u) {
+        gauss_it_main(GlobalInvocationID);
+    }
+    else if (pc.stage == 3u) {
+        rem_div_main(GlobalInvocationID);
+    }
+    else if (pc.stage == 4u) {
+        input_main(GlobalInvocationID);
+    }
+    bound(GlobalInvocationID.xy);
 }

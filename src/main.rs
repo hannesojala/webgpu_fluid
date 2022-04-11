@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use image::EncodableLayout;
 use pollster::block_on;
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -20,7 +19,7 @@ use wgpu::{
     PrimitiveState, PrimitiveTopology, PushConstantRange, Queue, RenderPipeline,
     RequestAdapterOptions, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages,
     Surface, SurfaceConfiguration, TextureDescriptor, TextureFormat, TextureSampleType,
-    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
+    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState, BufferAddress,
 };
 use winit::{
     dpi::PhysicalSize,
@@ -29,10 +28,10 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const SIMULATION_SIZE: usize = 512;
+const SIMULATION_SIZE: usize = 800;
 const WORK_GROUP_DIMENSIONS: u32 = 32; // x and y
 const TIMESTEP_SECONDS: f32 = 1.0 / 100.;
-const GAUSSS_QUAL: u32 = 100;
+const GAUSSS_QUAL: u32 = 50;
 
 #[repr(C)]
 struct PushContants {
@@ -41,32 +40,34 @@ struct PushContants {
     force_dir: (f32, f32),
     pressed: i32,
     dt_s: f32,
+    stage: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Cell(f32, f32, f32, f32);
+enum FluidStage {
+    Advection,
+    VorticityConfinement,
+    GaussSeidelIteration,
+    RemoveDivergence,
+    ForceInput,
+}
+
+impl From<FluidStage> for u32 {
+    fn from(stage: FluidStage) -> Self {
+        match stage {
+            FluidStage::Advection => 0,
+            FluidStage::VorticityConfinement => 1,
+            FluidStage::GaussSeidelIteration => 2,
+            FluidStage::RemoveDivergence => 3,
+            FluidStage::ForceInput => 4,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SimTime {
     timestep: Duration,
     current_time: Instant,
     accum_time: Duration,
-}
-
-#[derive(Clone, Copy)]
-struct MouseState {
-    position: (f64, f64),
-    b1_down: bool,
-}
-
-impl MouseState {
-    fn new() -> Self {
-        Self {
-            position: (0., 0.),
-            b1_down: false,
-        }
-    }
 }
 
 struct App {
@@ -77,11 +78,7 @@ struct App {
     vertex_buffer: Buffer,                  // Buffer of vertices to be drawn
     index_buffer: Buffer,                   // Buffer of indices to be drawn
     compute_bind_group: BindGroup,
-    input_compute_pipeline: ComputePipeline,
-    advect_compute_pipeline: ComputePipeline,
-    gausss_iter_compute_pipeline: ComputePipeline,
-    rem_div_compute_pipeline: ComputePipeline,
-    confine_vort_compute_pipeline: ComputePipeline,
+    compute_pipeline: ComputePipeline,
     vel_buff: Buffer,
     temp_buff_0: Buffer,
     temp_buff_1: Buffer,
@@ -90,8 +87,9 @@ struct App {
     vel_texture: wgpu::Texture,
     vel_texture_bind_group: BindGroup,      // Represents texture resources used by RenderPass
     vel_render_pipeline: RenderPipeline,
-    mouse_state: MouseState,
-    mouse_state_prev: MouseState,
+    mouse_pos: (f64,f64),
+    mouse_del: (f64,f64),
+    mouse_down: bool,
     sim_time: SimTime,
 }
 
@@ -134,7 +132,7 @@ impl App {
                 .expect("Surface is incompatible with adapter."),
             width: window.inner_size().width,
             height: window.inner_size().height,
-            present_mode: PresentMode::Fifo,
+            present_mode: PresentMode::Immediate,
         };
         surface.configure(&device, &surface_config);
 
@@ -159,7 +157,7 @@ impl App {
         // Wasteful, but easy to convert to a texture, and in the future the
         // extra components might be used.
         let velocity_buffer_bytes =
-            util::to_raw(&[Cell(0., 0., 0., 0.); SIMULATION_SIZE * SIMULATION_SIZE]);
+            util::to_raw(&[(0., 0., 0., 0.); SIMULATION_SIZE * SIMULATION_SIZE]);
         let vel_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: velocity_buffer_bytes,
@@ -192,32 +190,11 @@ impl App {
             format: TextureFormat::Rgba32Float,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         });
-        // Dummy texture data
-        // let gorilla = image::open("./gorilla.png")
-        //     .unwrap()
-        //     .resize_exact(
-        //         texture_size.width,
-        //         texture_size.height,
-        //         image::imageops::FilterType::Nearest,
-        //     )
-        //     .into_rgba32f();
-        // Enqueue a texture write
         let texture_layout = wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: NonZeroU32::new(mem::size_of::<Cell>() as u32 * texture_size.width),
+            bytes_per_row: NonZeroU32::new(mem::size_of::<(f32,f32,f32,f32)>() as u32 * texture_size.width),
             rows_per_image: NonZeroU32::new(texture_size.height),
         };
-        // queue.write_texture(
-        //     wgpu::ImageCopyTexture {
-        //         texture: &dye_texture,
-        //         mip_level: 0,
-        //         origin: wgpu::Origin3d::ZERO,
-        //         aspect: wgpu::TextureAspect::All,
-        //     },
-        //     gorilla.as_bytes(),
-        //     texture_layout,
-        //     texture_size,
-        // );
         // Create texture samplers
         let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -228,7 +205,6 @@ impl App {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-
         // Create a shader module from an include string
         let render_shader = device.create_shader_module(&ShaderModuleDescriptor {
             label: Some("Render Shader"),
@@ -297,58 +273,16 @@ impl App {
             stages: ShaderStages::COMPUTE,
             range: 0..std::mem::size_of::<PushContants>() as u32,
         };
-        let input_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("input_compute_pipeline"),
+        let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("main pipeline"),
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: Some("input_compute_pipeline PipelineLayoutDescriptor"),
+                label: Some("main pipeline PipelineLayoutDescriptor"),
                 bind_group_layouts: &[&compute_bind_group_layout],
-                push_constant_ranges: &[compute_push_constant_range.clone()],
+                push_constant_ranges: &[compute_push_constant_range],
             })),
             module: &compute_shader,
-            entry_point: "input_main",
+            entry_point: "main",
         });
-        let advect_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("advect_compute_pipeline"),
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: Some("advect_compute_pipeline PipelineLayoutDescriptor"),
-                bind_group_layouts: &[&compute_bind_group_layout],
-                push_constant_ranges: &[compute_push_constant_range.clone()],
-            })),
-            module: &compute_shader,
-            entry_point: "advect_main",
-        });
-        let gausss_iter_compute_pipeline =
-            device.create_compute_pipeline(&ComputePipelineDescriptor {
-                label: Some("gausss_iter_compute_pipeline"),
-                layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                    label: Some("gausss_iter_compute_pipeline PipelineLayoutDescriptor"),
-                    bind_group_layouts: &[&compute_bind_group_layout],
-                    push_constant_ranges: &[compute_push_constant_range.clone()],
-                })),
-                module: &compute_shader,
-                entry_point: "gauss_it_main",
-            });
-        let rem_div_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("rem_div_compute_pipeline Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: Some("rem_div_compute_pipeline PipelineLayoutDescriptor"),
-                bind_group_layouts: &[&compute_bind_group_layout],
-                push_constant_ranges: &[compute_push_constant_range.clone()],
-            })),
-            module: &compute_shader,
-            entry_point: "rem_div_main",
-        });
-        let confine_vort_compute_pipeline =
-            device.create_compute_pipeline(&ComputePipelineDescriptor {
-                label: Some("confine_vort_compute_pipeline"),
-                layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                    label: Some("confine_vort_compute_pipeline PipelineLayoutDescriptor"),
-                    bind_group_layouts: &[&compute_bind_group_layout],
-                    push_constant_ranges: &[compute_push_constant_range.clone()],
-                })),
-                module: &compute_shader,
-                entry_point: "confine_vort_main",
-            });
 
         // Create bind group layout describing texture and sampler
         let texture_bind_group_layout =
@@ -449,13 +383,10 @@ impl App {
             vel_texture_bind_group,
             vel_render_pipeline,
             compute_bind_group,
-            input_compute_pipeline,
-            advect_compute_pipeline,
-            gausss_iter_compute_pipeline,
-            rem_div_compute_pipeline,
-            confine_vort_compute_pipeline,
-            mouse_state: MouseState::new(),
-            mouse_state_prev: MouseState::new(),
+            compute_pipeline,
+            mouse_pos: (0.0,0.0),
+            mouse_del: (0.0,0.0),
+            mouse_down: false,
             sim_time: SimTime {
                 timestep: Duration::from_secs_f32(TIMESTEP_SECONDS),
                 current_time: Instant::now(),
@@ -515,35 +446,33 @@ impl App {
         swapchain_texture.present();
     }
 
-    fn mouse_delta(&self) -> (f32,f32) {
-        (
-            (self.mouse_state.position.0 - self.mouse_state_prev.position.0) as f32,
-            (self.mouse_state.position.1 - self.mouse_state_prev.position.1) as f32,
-        )
-    }
-
-    fn get_push_consts(&self) -> PushContants {
+    fn get_push_consts(&self, stage: FluidStage) -> PushContants {
         // Convert the mouse window coordinates to simulation coordinates
         let force_pos = (
-            self.mouse_state.position.0 as i32 * SIMULATION_SIZE as i32
+            self.mouse_pos.0 as i32 * SIMULATION_SIZE as i32
                 / self.surface_config.width as i32,
-            self.mouse_state.position.1 as i32 * SIMULATION_SIZE as i32
+            self.mouse_pos.1 as i32 * SIMULATION_SIZE as i32
                 / self.surface_config.height as i32,
         );
         PushContants {
             dimension: (SIMULATION_SIZE as u32, SIMULATION_SIZE as u32),
             force_pos,
-            force_dir: self.mouse_delta(),
-            pressed: self.mouse_state.b1_down as i32,
+            force_dir: (self.mouse_del.0 as f32, self.mouse_del.1 as f32),
+            pressed: self.mouse_down as i32,
             dt_s: self.sim_time.timestep.as_secs_f32(),
+            stage: stage.into(),
         }
     }
 
-    fn compute_passes(&self, encoder: &mut CommandEncoder, timesteps: u32) {
+    // Update state and tell compute shader what to do
+    fn update(&mut self, timesteps: u32) {
         let (dispatch_width, dispatch_height) = util::compute_work_group_count(
             (SIMULATION_SIZE as u32, SIMULATION_SIZE as u32),
             (WORK_GROUP_DIMENSIONS, WORK_GROUP_DIMENSIONS),
         );
+
+        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Compute Encoder"),});
 
         // Zero temp buffers
         // Comment out for buggy fake pressure (look at the compressible continuity eq for an idea why this works?)
@@ -554,55 +483,34 @@ impl App {
         let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("Compute Pass"),
         });
+        compute_pass.set_pipeline(&self.compute_pipeline);
+        compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
 
         for _ in 0..timesteps {
             // Pass: Advection
-            compute_pass.set_pipeline(&self.advect_compute_pipeline);
-            let push_consts = self.get_push_consts();
-            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::Advection)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Confine Vorticity
-            compute_pass.set_pipeline(&self.confine_vort_compute_pipeline);
-            let push_consts = self.get_push_consts();
-            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::VorticityConfinement)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Gauss-Seidel iteration
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::GaussSeidelIteration)]));
             for _ in 0..GAUSSS_QUAL {
-                compute_pass.set_pipeline(&self.gausss_iter_compute_pipeline);
-                let push_consts = self.get_push_consts();
-                compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                // Swap temp buffers
+                // WHY OH WHY OH WHY I WILL NEVER DISPARAGE VULKAN SYNCHRONIZATION EVER AGAIN!
+                // encoder.copy_buffer_to_buffer(&self.temp_buff_1, 0, &self.temp_buff_0, 0, self.temp_buff_size);
                 compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             }
             // Pass: Remove divergence
-            compute_pass.set_pipeline(&self.rem_div_compute_pipeline);
-            let push_consts = self.get_push_consts();
-            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::RemoveDivergence)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Input
-            compute_pass.set_pipeline(&self.input_compute_pipeline);
-            let push_consts = self.get_push_consts();
-            compute_pass.set_push_constants(0, util::to_raw(&[push_consts]));
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::ForceInput)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
         }
-    }
+        drop(compute_pass);
 
-    // Update state and tell compute shader what to do
-    fn update(&mut self, timesteps: u32) {
-        // Create an encoder and encode the compute pass.
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
-            });
-        self.compute_passes(&mut encoder, timesteps);
         // Swap simulation buffers and copy to texture to visualize
-        // Note on perf:
-        // These operations could be avoided if I was less lazy and stupid
         encoder.copy_buffer_to_texture(
             ImageCopyBuffer {
                 buffer: &self.vel_buff,
@@ -616,7 +524,6 @@ impl App {
             },
             self.texture_size,
         );
-
         self.queue.submit([encoder.finish()]);
     }
 
@@ -655,14 +562,18 @@ impl App {
             } => return ControlFlow::Exit,
             WindowEvent::Resized(size) => self.resize_surface(*size),
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_state.position = (position.x, position.y);
+                self.mouse_del = (position.x - self.mouse_pos.0, position.y - self.mouse_pos.1);
+                self.mouse_pos = (position.x, position.y);
             }
             WindowEvent::MouseInput { button, state, .. } => match button {
                 winit::event::MouseButton::Left => {
-                    self.mouse_state.b1_down = match state {
+                    self.mouse_down = match state {
                         ElementState::Pressed => true,
                         ElementState::Released => false,
                     }
+                }
+                winit::event::MouseButton::Right => {
+                    
                 }
                 _ => {}
             },
@@ -675,14 +586,14 @@ impl App {
         let timesteps = self.perf();
         self.update(timesteps);
         self.render();
-        self.mouse_state_prev = self.mouse_state;
+        self.mouse_del = (0.0,0.0);
     }
 }
 
 fn main() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_inner_size(PhysicalSize::new(720, 720))
+        .with_inner_size(PhysicalSize::new(SIMULATION_SIZE as u32, SIMULATION_SIZE as u32))
         .build(&event_loop)
         .unwrap();
     let mut app = App::new(&window);
