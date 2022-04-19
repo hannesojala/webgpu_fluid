@@ -79,22 +79,14 @@ fn bound(coords: vec2<u32>) {
 fn add_input(coords: vec2<u32>) {
     let dt = pc.dt_s;
     let size = vec2<f32>(pc.dimension);
-    let range = (size.x + size.y) / 2.0;
+    let range = (size.x + size.y) / 32.0;
     let dist = distance(vec2<f32>(coords), vec2<f32>(pc.force_pos));
     let do_draw = f32(pc.pressed == 1) * f32(dist < range);   // TODO: draw size push const
-    let new = vel_at(coords) + ((do_draw * dt * (range/pow(dist+1.0,2.0))) * pc.force_dir);
+    let new = vel_at(coords) + (do_draw * dt * pc.force_dir);
     set_vel(coords, new);
 }
 
-fn input_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        // add input forces
-        add_input(coords);
-    }
-}
-
+// TODO: DATA RACE IN ADVECTION!
 fn advect(coords: vec2<u32>) {
     let size = vec2<f32>(pc.dimension);
     let dt = pc.dt_s;
@@ -135,24 +127,6 @@ fn advect_dye(coords: vec2<u32>) {
     set_dye(coords, blerped);
 }
 
-fn advect_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        // advect
-        advect(coords);
-    }
-}
-
-fn advect_dye_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        // advect
-        advect_dye(coords);
-    }
-}
-
 fn get_div(coords: vec2<u32>) -> f32 {
     let size = vec2<f32>(pc.dimension);
     let u = vel_at(coords - vec2<u32>(0u, 1u)).y;
@@ -175,14 +149,6 @@ fn gausss(coords: vec2<u32>) {
     // div_sol now in temp1.data
 }
 
-fn gauss_it_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        gausss(coords);
-    }
-}
-
 fn rem_div(coords: vec2<u32>) {
     // div_sol now in temp1.data
     // // removing the divergence:
@@ -193,14 +159,6 @@ fn rem_div(coords: vec2<u32>) {
     );
     let divless = vel_at(coords) - (grad_div * size);
     set_vel(coords, divless);
-}
-
-fn rem_div_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
-        rem_div(coords);
-    }
 }
 
 fn vel_curl_at(coords: vec2<u32>) -> f32 {
@@ -225,35 +183,41 @@ fn confine_vort(coords: vec2<u32>) {
     set_vel(coords, adjustment);
 }
 
-fn confine_vort_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
-    let coords = GlobalInvocationID.xy;
-    let size = (pc.dimension);
-    // note smaller bounds
-    if (coords.x > 1u && coords.x < (size.x - 2u) && coords.y > 1u && coords.y < (size.y - 2u)) {
-        confine_vort(coords);
-    }
-}
-
 // todo: enum thing?
 [[stage(compute), workgroup_size(32,32)]]
 fn main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
+    let coords = GlobalInvocationID.xy;
+    let size = (pc.dimension);
     if (pc.stage == 0u) {
-        advect_main(GlobalInvocationID);
+        if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+            advect(coords);
+        }
     }
     else if (pc.stage == 1u) {
-        confine_vort_main(GlobalInvocationID);
+        if (coords.x > 1u && coords.x < (size.x - 2u) && coords.y > 1u && coords.y < (size.y - 2u)) {
+            confine_vort(coords);
+        }
     }
     else if (pc.stage == 2u) {
-        gauss_it_main(GlobalInvocationID);
+        if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+            gausss(coords);
+        }
     }
     else if (pc.stage == 3u) {
-        rem_div_main(GlobalInvocationID);
+        if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+            rem_div(coords);
+        }
     }
     else if (pc.stage == 4u) {
-        input_main(GlobalInvocationID);
+        if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+            // add input forces
+            add_input(coords);
+        }
     }
     else if (pc.stage == 5u) {
-        advect_dye_main(GlobalInvocationID);
+        if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+            advect_dye(coords);
+        }
     }
     bound(GlobalInvocationID.xy);
 }

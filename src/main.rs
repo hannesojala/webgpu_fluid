@@ -29,9 +29,9 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const SIMULATION_SIZE: usize = 800;
+const SIMULATION_SIZE: usize = 1024;
 const WORK_GROUP_DIMENSIONS: u32 = 32; // x and y
-const TIMESTEP_SECONDS: f32 = 1.0 / 100.;
+const TIMESTEP_SECONDS: f32 = 1.0 / 60.;
 const GAUSSS_QUAL: u32 = 50;
 
 #[repr(C)]
