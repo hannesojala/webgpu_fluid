@@ -1,4 +1,4 @@
-struct Velocity {
+struct Vec4Arr {
     data: array<vec4<f32>>;
 };
 
@@ -15,9 +15,10 @@ struct PushConstants {
     stage: u32;
 };
 
-[[group(0), binding(0)]] var<storage, read_write> velocity: Velocity;
+[[group(0), binding(0)]] var<storage, read_write> velocity: Vec4Arr;
 [[group(0), binding(1)]] var<storage, read_write> temp1: FloatArr;
 [[group(0), binding(2)]] var<storage, read_write> temp2: FloatArr;
+[[group(0), binding(3)]] var<storage, read_write> dye_arr: Vec4Arr;
 
 var<push_constant> pc: PushConstants;
 
@@ -34,7 +35,19 @@ fn set_vel(coords: vec2<u32>, vel: vec2<f32>) {
     velocity.data[idx(coords)].y = vel.y;
 }
 
+fn dye_at(coords: vec2<u32>) -> vec4<f32> {
+    return dye_arr.data[idx(coords)];
+}
+
+fn set_dye(coords: vec2<u32>, dye: vec4<f32>) {
+    dye_arr.data[idx(coords)] = dye;
+}
+
 fn blerp(v1: vec2<f32>, v2: vec2<f32>, v3: vec2<f32>, v4: vec2<f32>, k: vec2<f32>) -> vec2<f32> {
+    return mix(mix(v1, v2, k.x), mix(v3, v4, k.x), k.y);
+}
+// todo: merge
+fn blerp_vec4(v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, k: vec2<f32>) -> vec4<f32> {
     return mix(mix(v1, v2, k.x), mix(v3, v4, k.x), k.y);
 }
 
@@ -101,6 +114,26 @@ fn advect(coords: vec2<u32>) {
     let blerped = blerp(s0,s1,s2,s3,fract(pos_0));
     set_vel(coords, blerped);
 }
+// TODO: merge?
+fn advect_dye(coords: vec2<u32>) {
+    let size = vec2<f32>(pc.dimension);
+    let dt = pc.dt_s;
+    // trace back
+    let pos_0 = clamp(
+        vec2<f32>(coords) - (dt * vel_at(coords) * size), 
+        vec2<f32>(1.5, 1.5), 
+        vec2<f32>(size.x - 1.0 - 1.5, size.y - 1.0 - 1.5)
+    );
+    // sample
+    let whole = vec2<u32>(floor(pos_0)); // floor rounding?
+    let s0 = dye_at(whole);
+    let s1 = dye_at(whole + vec2<u32>(1u, 0u));
+    let s2 = dye_at(whole + vec2<u32>(0u, 1u));
+    let s3 = dye_at(whole + vec2<u32>(1u, 1u));
+    // blerp
+    let blerped = blerp_vec4(s0,s1,s2,s3,fract(pos_0));
+    set_dye(coords, blerped);
+}
 
 fn advect_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     let coords = GlobalInvocationID.xy;
@@ -108,6 +141,15 @@ fn advect_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>)
     if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
         // advect
         advect(coords);
+    }
+}
+
+fn advect_dye_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
+    let coords = GlobalInvocationID.xy;
+    let size = (pc.dimension);
+    if (coords.x > 0u && coords.x < (size.x - 1u) && coords.y > 0u && coords.y < (size.y - 1u)) {
+        // advect
+        advect_dye(coords);
     }
 }
 
@@ -121,7 +163,6 @@ fn get_div(coords: vec2<u32>) -> f32 {
 }
 
 fn gausss(coords: vec2<u32>) {
-    let div = get_div(coords);
     // TODO: Swap buffers outside
     // TODO: data race? (probably just makes it converge more slowly?)
     temp2.data[idx(coords)] = temp1.data[idx(coords)];
@@ -130,7 +171,7 @@ fn gausss(coords: vec2<u32>) {
     let d = temp2.data[idx(coords + vec2<u32>(0u, 1u))];
     let l = temp2.data[idx(coords - vec2<u32>(1u, 0u))];
     let r = temp2.data[idx(coords + vec2<u32>(1u, 0u))];
-    temp1.data[idx(coords)] = (div + u + d + l + r) / 4.0;
+    temp1.data[idx(coords)] = (get_div(coords) + u + d + l + r) / 4.0; // todo: alpha parameter = size^2?
     // div_sol now in temp1.data
 }
 
@@ -193,6 +234,7 @@ fn confine_vort_main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3
     }
 }
 
+// todo: enum thing?
 [[stage(compute), workgroup_size(32,32)]]
 fn main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     if (pc.stage == 0u) {
@@ -209,6 +251,9 @@ fn main([[builtin(global_invocation_id)]] GlobalInvocationID : vec3<u32>) {
     }
     else if (pc.stage == 4u) {
         input_main(GlobalInvocationID);
+    }
+    else if (pc.stage == 5u) {
+        advect_dye_main(GlobalInvocationID);
     }
     bound(GlobalInvocationID.xy);
 }

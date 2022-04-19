@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use image::{imageops::FilterType, EncodableLayout};
 use pollster::block_on;
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -44,23 +45,16 @@ struct PushContants {
 }
 
 enum FluidStage {
-    Advection,
-    VorticityConfinement,
-    GaussSeidelIteration,
-    RemoveDivergence,
-    ForceInput,
+    Advection               = 0,
+    VorticityConfinement    = 1,
+    GaussSeidelIteration    = 2,
+    RemoveDivergence        = 3,
+    ForceInput              = 4,
+    AdvectDye               = 5,
 }
 
-impl From<FluidStage> for u32 {
-    fn from(stage: FluidStage) -> Self {
-        match stage {
-            FluidStage::Advection => 0,
-            FluidStage::VorticityConfinement => 1,
-            FluidStage::GaussSeidelIteration => 2,
-            FluidStage::RemoveDivergence => 3,
-            FluidStage::ForceInput => 4,
-        }
-    }
+enum RenderMode {
+    Velocity, Dye
 }
 
 #[derive(Debug)]
@@ -80,17 +74,20 @@ struct App {
     compute_bind_group: BindGroup,
     compute_pipeline: ComputePipeline,
     vel_buff: Buffer,
+    dye_buff: Buffer,
     temp_buff_0: Buffer,
     temp_buff_1: Buffer,
     texture_layout: ImageDataLayout,
     texture_size: wgpu::Extent3d,
-    vel_texture: wgpu::Texture,
-    vel_texture_bind_group: BindGroup,      // Represents texture resources used by RenderPass
-    vel_render_pipeline: RenderPipeline,
+    render_texture: wgpu::Texture,
+    render_texture_bind_group: BindGroup,      // Represents texture resources used by RenderPass
+    vec_render_pipeline: RenderPipeline,
+    dye_render_pipeline: RenderPipeline,
     mouse_pos: (f64,f64),
     mouse_del: (f64,f64),
     mouse_down: bool,
     sim_time: SimTime,
+    render_mode: RenderMode,
 }
 
 impl App {
@@ -127,9 +124,7 @@ impl App {
         // Surface properties
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
-            format: surface
-                .get_preferred_format(&adapter)
-                .expect("Surface is incompatible with adapter."),
+            format: TextureFormat::Bgra8Unorm,
             width: window.inner_size().width,
             height: window.inner_size().height,
             present_mode: PresentMode::Immediate,
@@ -137,30 +132,39 @@ impl App {
         surface.configure(&device, &surface_config);
 
         // Buffers
-        // I know theres now reason to do this for a simple screen quad but I wanted
+        // I know theres no reason to do this for a simple screen quad but I wanted
         // to see how things were different in this API and a refresher never hurts.
 
         // Stores the screen quad vertices
         let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: util::to_raw(vertex::VERTICES),
+            contents: util::to_raw(vertex::SCREEN_QUAD_VERTICES),
             usage: BufferUsages::VERTEX,
         });
         // Stores the screen quad indices
         let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: util::to_raw(vertex::INDICES),
+            contents: util::to_raw(vertex::SCREEN_QUAD_INDICES),
             usage: BufferUsages::INDEX,
         });
         // A buffer of float zeroes
         // 4 floats per pixel (2 velocity components + two unused)
         // Wasteful, but easy to convert to a texture, and in the future the
-        // extra components might be used.
-        let velocity_buffer_bytes =
-            util::to_raw(&[(0., 0., 0., 0.); SIMULATION_SIZE * SIMULATION_SIZE]);
+        // extra components will be used.
+        let vel_buffer_bytes = util::to_raw(&[(0f32, 0f32, 0f32, 0f32); SIMULATION_SIZE * SIMULATION_SIZE]);
         let vel_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
-            contents: velocity_buffer_bytes,
+            contents: vel_buffer_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let gorilla = image::open("gorilla.png").expect("No gorilla :(");
+        let gorilla = gorilla.resize_exact(SIMULATION_SIZE as u32, SIMULATION_SIZE as u32, FilterType::Nearest);
+        let gorilla = gorilla.into_rgba32f();
+        println!("{:?}, {:?}", gorilla.as_bytes().len(), vel_buffer_bytes.len());
+        assert!(gorilla.as_bytes().len() == vel_buffer_bytes.len());
+        let dye_buff = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("vel_buff"),
+            contents: gorilla.as_bytes(),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
         let temp_buffer_bytes = util::to_raw(&[0.0; SIMULATION_SIZE * SIMULATION_SIZE]);
@@ -181,8 +185,8 @@ impl App {
             height: SIMULATION_SIZE as u32,
             depth_or_array_layers: 1,
         };
-        let vel_texture = device.create_texture(&TextureDescriptor {
-            label: Some("velTexture"),
+        let render_texture = device.create_texture(&TextureDescriptor {
+            label: Some("vel_texture"),
             size: texture_size,
             mip_level_count: 1,
             sample_count: 1,
@@ -249,6 +253,16 @@ impl App {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -266,6 +280,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: temp_buff_1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dye_buff.as_entire_binding(),
                 },
             ],
         });
@@ -308,13 +326,13 @@ impl App {
                 label: Some("texture_bind_group_layout"),
             });
         // Create bind group describing a specific texture and sampler in the layout described
-        let vel_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &vel_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                        &render_texture.create_view(&wgpu::TextureViewDescriptor::default()),
                     ),
                 },
                 wgpu::BindGroupEntry {
@@ -325,7 +343,7 @@ impl App {
             label: Some("bind_group"),
         });
         // Create render pipeline
-        let vel_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let vec_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             // Provide the layouts this pipeline will require
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -341,7 +359,49 @@ impl App {
             },
             fragment: Some(FragmentState {
                 module: &render_shader,
-                entry_point: "fs_main",
+                entry_point: "vec_main",
+                targets: &[ColorTargetState {
+                    // Describes how the color will be written
+                    format: surface_config.format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                }],
+            }),
+            primitive: PrimitiveState {
+                // Describes how vertices are interpreted into triangles and filled
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+        let dye_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            // Provide the layouts this pipeline will require
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout Descriptor"),
+                bind_group_layouts: &[&texture_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            // Specify the shader stages
+            vertex: VertexState {
+                module: &render_shader,
+                entry_point: "vs_main",
+                buffers: &[vertex::Vertex::buffer_layout()], // The format of the buffer
+            },
+            fragment: Some(FragmentState {
+                module: &render_shader,
+                entry_point: "dye_main",
                 targets: &[ColorTargetState {
                     // Describes how the color will be written
                     format: surface_config.format,
@@ -375,13 +435,15 @@ impl App {
             vertex_buffer,
             index_buffer,
             vel_buff,
+            dye_buff,
             temp_buff_0,
             temp_buff_1,
-            vel_texture,
+            render_texture,
             texture_size,
             texture_layout,
-            vel_texture_bind_group,
-            vel_render_pipeline,
+            render_texture_bind_group,
+            vec_render_pipeline,
+            dye_render_pipeline,
             compute_bind_group,
             compute_pipeline,
             mouse_pos: (0.0,0.0),
@@ -392,6 +454,7 @@ impl App {
                 current_time: Instant::now(),
                 accum_time: Duration::ZERO,
             },
+            render_mode: RenderMode::Dye,
         }
     }
 
@@ -415,8 +478,12 @@ impl App {
             }],
             depth_stencil_attachment: None,
         });
-        render_pass.set_pipeline(&self.vel_render_pipeline);
-        render_pass.set_bind_group(0, &self.vel_texture_bind_group, &[]);
+        let render_pipeline = match self.render_mode {
+            RenderMode::Velocity => &self.vec_render_pipeline,
+            RenderMode::Dye => &self.dye_render_pipeline,
+        };
+        render_pass.set_pipeline(render_pipeline);
+        render_pass.set_bind_group(0, &self.render_texture_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
         render_pass.draw_indexed(0..6, 0, 0..1);
@@ -460,7 +527,7 @@ impl App {
             force_dir: (self.mouse_del.0 as f32, self.mouse_del.1 as f32),
             pressed: self.mouse_down as i32,
             dt_s: self.sim_time.timestep.as_secs_f32(),
-            stage: stage.into(),
+            stage: stage as u32,
         }
     }
 
@@ -496,7 +563,7 @@ impl App {
             // Pass: Gauss-Seidel iteration
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::GaussSeidelIteration)]));
             for _ in 0..GAUSSS_QUAL {
-                // Swap temp buffers
+                // Swap temp buffers (OH I CAN'T)
                 // WHY OH WHY OH WHY I WILL NEVER DISPARAGE VULKAN SYNCHRONIZATION EVER AGAIN!
                 // encoder.copy_buffer_to_buffer(&self.temp_buff_1, 0, &self.temp_buff_0, 0, self.temp_buff_size);
                 compute_pass.dispatch(dispatch_width, dispatch_height, 1);
@@ -507,17 +574,24 @@ impl App {
             // Pass: Input
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::ForceInput)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            // Advect Dye
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::AdvectDye)]));
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
         }
         drop(compute_pass);
 
         // Swap simulation buffers and copy to texture to visualize
+        let buff_to_render = match self.render_mode {
+            RenderMode::Velocity => &self.vel_buff,
+            RenderMode::Dye => &self.dye_buff,
+        };
         encoder.copy_buffer_to_texture(
             ImageCopyBuffer {
-                buffer: &self.vel_buff,
+                buffer: buff_to_render,
                 layout: self.texture_layout,
             },
             ImageCopyTexture {
-                texture: &self.vel_texture,
+                texture: &self.render_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -550,16 +624,14 @@ impl App {
     // events may be preferred for things like raw mouse delta or kb state.
     fn handle_window_event(&mut self, event: &WindowEvent) -> ControlFlow {
         match event {
-            WindowEvent::CloseRequested
-            | WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::Escape),
-                        ..
-                    },
-                ..
-            } => return ControlFlow::Exit,
+            WindowEvent::CloseRequested => return ControlFlow::Exit,
+            WindowEvent::KeyboardInput {input, ..} => {
+                match input.virtual_keycode {
+                    Some(VirtualKeyCode::Key1) => self.render_mode = RenderMode::Dye,
+                    Some(VirtualKeyCode::Key2) => self.render_mode = RenderMode::Velocity,
+                    _ => {}
+                }
+            },
             WindowEvent::Resized(size) => self.resize_surface(*size),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_del = (position.x - self.mouse_pos.0, position.y - self.mouse_pos.1);

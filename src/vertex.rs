@@ -24,7 +24,7 @@ impl Vertex {
 }
 
 // Screen quad positions
-pub const VERTICES: &[Vertex] = &[
+pub const SCREEN_QUAD_VERTICES: &[Vertex] = &[
     Vertex {
         position: [1.0, 1.0, 0.0],
         tex_coords: [1.0, 0.0],
@@ -44,4 +44,4 @@ pub const VERTICES: &[Vertex] = &[
 ];
 
 // Screen quad indices for rendering as a triangle list
-pub const INDICES: &[u32] = &[0, 1, 2, 0, 2, 3];
+pub const SCREEN_QUAD_INDICES: &[u32] = &[0, 1, 2, 0, 2, 3];

@@ -22,16 +22,23 @@ fn vs_main(
 
 // Fragment shader
 
-[[group(0), binding(0)]] var vel_tex: texture_2d<f32>;
+[[group(0), binding(0)]] var tex: texture_2d<f32>;
 [[group(0), binding(1)]] var samp: sampler;
 
 [[stage(fragment)]]
-fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
-    let vel = textureSample(vel_tex, samp, in.tex_coord);
+fn vec_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
+    let vel = textureSample(tex, samp, in.tex_coord);
     let r  = abs(clamp(vel.x,  0.0, 1.0));
     let g = (abs(clamp(vel.x, -1.0, 0.0)) + abs(clamp(vel.y,  0.0, 1.0))) / 2.0;
     let b  = abs(clamp(vel.y, -1.0, 0.0));
     return vec4<f32>(r,g,b, 1.0);
+}
+
+[[stage(fragment)]]
+fn dye_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
+    let sample = textureSample(tex, samp, in.tex_coord);
+    //let adj = vec4<f32>(pow(sample.rgb, vec3<f32>(1.0 / 2.2)), 1.0);
+    return sample;
 }
 
  
