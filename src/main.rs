@@ -47,11 +47,14 @@ struct PushContants {
 
 enum FluidStage {
     Advection               = 0,
-    VorticityConfinement    = 1,
-    GaussSeidelIteration    = 2,
-    RemoveDivergence        = 3,
-    ForceInput              = 4,
-    AdvectDye               = 5,
+    SwapVel                 = 1,
+    VorticityConfinement    = 2,
+    GaussSeidelIteration    = 3,
+    SwapTemp                = 4,
+    RemoveDivergence        = 5,
+    ForceInput              = 6,
+    AdvectDye               = 7,
+    SwapDye                 = 8,
 }
 
 enum RenderMode {
@@ -76,14 +79,16 @@ struct App {
     compute_bind_group: BindGroup,
     compute_pipeline: ComputePipeline,
     vel_buff: Buffer,
+    vel_tmp_buff: Buffer,
     dye_buff: Buffer,
-    temp_buff_0: Buffer,
+    dye_tmp_buff: Buffer,
     temp_buff_1: Buffer,
+    temp_buff_2: Buffer,
     texture_layout: ImageDataLayout,
     texture_size: wgpu::Extent3d,
     render_texture: wgpu::Texture,
     render_texture_bind_group: BindGroup,      // Represents texture resources used by RenderPass
-    vec_render_pipeline: RenderPipeline,
+    vel_render_pipeline: RenderPipeline,
     dye_render_pipeline: RenderPipeline,
     mouse_pos: (f64,f64),
     mouse_del: (f64,f64),
@@ -180,31 +185,39 @@ impl App {
         // 4 floats per pixel (2 velocity components + two unused)
         // Wasteful, but easy to convert to a texture, and in the future the
         // extra components will be used.
-        let vel_buffer_bytes = util::to_raw(&[(0f32, 0f32, 0f32, 0f32); SIMULATION_SIZE * SIMULATION_SIZE]);
+        let vec4_buffer_bytes = util::to_raw(&[(0f32, 0f32, 0f32, 0f32); SIMULATION_SIZE * SIMULATION_SIZE]);
         let vel_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
-            contents: vel_buffer_bytes,
+            contents: vec4_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let vel_tmp_buff = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("vel_tmp_buff"),
+            contents: vec4_buffer_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let gorilla = image::open("gorilla.png").expect("No gorilla :(");
         let gorilla = gorilla.resize_exact(SIMULATION_SIZE as u32, SIMULATION_SIZE as u32, FilterType::Nearest);
         let gorilla = gorilla.into_rgba32f();
-        println!("{:?}, {:?}", gorilla.as_bytes().len(), vel_buffer_bytes.len());
-        assert!(gorilla.as_bytes().len() == vel_buffer_bytes.len());
         let dye_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: gorilla.as_bytes(),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
-        let temp_buffer_bytes = util::to_raw(&[0.0; SIMULATION_SIZE * SIMULATION_SIZE]);
-        let temp_buff_0 = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("temp_buff_0"),
-            contents: temp_buffer_bytes,
+        let dye_tmp_buff = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("dye_tmp_buff"),
+            contents: vec4_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
+        let float_buffer_bytes = util::to_raw(&[0.0; SIMULATION_SIZE * SIMULATION_SIZE]);
         let temp_buff_1 = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("temp_buff_1"),
-            contents: temp_buffer_bytes,
+            contents: float_buffer_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let temp_buff_2 = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("temp_buff_2"),
+            contents: float_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
@@ -292,6 +305,26 @@ impl App {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -304,15 +337,23 @@ impl App {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: temp_buff_0.as_entire_binding(),
+                    resource: vel_tmp_buff.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: temp_buff_1.as_entire_binding(),
+                    resource: dye_buff.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: dye_buff.as_entire_binding(),
+                    resource: dye_tmp_buff.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: temp_buff_1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: temp_buff_2.as_entire_binding(),
                 },
             ],
         });
@@ -372,7 +413,7 @@ impl App {
             label: Some("bind_group"),
         });
         // Create render pipeline
-        let vec_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let vel_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             // Provide the layouts this pipeline will require
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -388,7 +429,7 @@ impl App {
             },
             fragment: Some(FragmentState {
                 module: &render_shader,
-                entry_point: "vec_main",
+                entry_point: "vel_main",
                 targets: &[ColorTargetState {
                     // Describes how the color will be written
                     format: surface_config.format,
@@ -466,14 +507,16 @@ impl App {
             compute_bind_group,
             compute_pipeline,
             vel_buff,
+            vel_tmp_buff,
             dye_buff,
-            temp_buff_0,
+            dye_tmp_buff,
             temp_buff_1,
+            temp_buff_2,
+            render_texture,
             texture_layout,
             texture_size,
-            render_texture,
             render_texture_bind_group,
-            vec_render_pipeline,
+            vel_render_pipeline,
             dye_render_pipeline,
             mouse_pos: (0.0,0.0),
             mouse_del: (0.0,0.0),
@@ -562,7 +605,7 @@ impl App {
             depth_stencil_attachment: None,
         });
         let render_pipeline = match self.render_mode {
-            RenderMode::Velocity => &self.vec_render_pipeline,
+            RenderMode::Velocity => &self.vel_render_pipeline,
             RenderMode::Dye => &self.dye_render_pipeline,
         };
         render_pass.set_pipeline(render_pipeline);
@@ -607,10 +650,12 @@ impl App {
             label: Some("Compute Encoder"),});
 
         // Zero temp buffers
-        // Comment out for buggy fake pressure (look at the compressible continuity eq for an idea why this works?)
+        // Comment temp 1,2 out for buggy fake pressure (look at the compressible continuity eq for an idea why this works?)
         // todo: 
-        encoder.clear_buffer(&self.temp_buff_0, 0, None);
+        encoder.clear_buffer(&self.vel_tmp_buff, 0, None); 
+        encoder.clear_buffer(&self.dye_tmp_buff, 0, None); 
         encoder.clear_buffer(&self.temp_buff_1, 0, None);
+        encoder.clear_buffer(&self.temp_buff_2, 0, None);
 
         let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("Compute Pass"),
@@ -622,15 +667,16 @@ impl App {
             // Pass: Advection
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::Advection)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapVel)]));
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Confine Vorticity
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::VorticityConfinement)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Pass: Gauss-Seidel iteration
-            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::GaussSeidelIteration)]));
             for _ in 0..GAUSSS_QUAL {
-                // Swap temp buffers (OH I CAN'T)
-                // WHY OH WHY OH WHY I WILL NEVER DISPARAGE VULKAN SYNCHRONIZATION EVER AGAIN!
-                // encoder.copy_buffer_to_buffer(&self.temp_buff_1, 0, &self.temp_buff_0, 0, self.temp_buff_size);
+                compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::GaussSeidelIteration)]));
+                compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+                compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapTemp)]));
                 compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             }
             // Pass: Remove divergence
@@ -641,6 +687,8 @@ impl App {
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Advect Dye
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::AdvectDye)]));
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapDye)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
         }
         drop(compute_pass);
@@ -664,26 +712,6 @@ impl App {
             self.texture_size,
         );
         self.queue.submit([encoder.finish()]);
-    }
-
-    // returns the amount of accumulated timesteps to simulate
-    fn perf(&mut self) -> u32 {
-        let elapsed_time = self.sim_time.current_time.elapsed();
-        self.imgui.io_mut().update_delta_time(elapsed_time);
-        self.sim_time.current_time = Instant::now();
-        self.sim_time.accum_time += elapsed_time;
-        let mut num_timesteps = 0;
-        println!("================\nelapsed: {elapsed_time:?}");
-        println!("accumulated: {:?}", self.sim_time.accum_time);
-        while self.sim_time.accum_time > self.sim_time.timestep {
-            self.sim_time.accum_time -= self.sim_time.timestep;
-            num_timesteps += 1;
-        }
-        println!(
-            "Simulating {:?}ms {num_timesteps} times.",
-            self.sim_time.timestep.as_millis()
-        );
-        num_timesteps
     }
 
     // For some purposes in the future (unlikely for this application), device
@@ -721,10 +749,16 @@ impl App {
     }
 
     fn run(&mut self, window: &Window) {
-        let timesteps = self.perf();
-        self.update(timesteps);
+        let elapsed_time = self.sim_time.current_time.elapsed();
+        self.sim_time.current_time = Instant::now();
+        self.sim_time.accum_time += elapsed_time;
+        println!("================\nelapsed: {elapsed_time:?}");
+        println!("Behind by: {:?}", self.sim_time.accum_time);
+        if self.sim_time.accum_time > self.sim_time.timestep {
+            self.sim_time.accum_time -= self.sim_time.timestep;
+            self.update(1);
+        }
         self.render(window);
-        self.mouse_del = (0.0,0.0);
     }
 }
 
