@@ -114,9 +114,10 @@ fn bound(coords: vec2<u32>) {
 fn add_input(coords: vec2<u32>) {
     let dt = pc.dt_s;
     let size = vec2<f32>(pc.dimension);
+    let range = max(size.x, size.y) / 32.0;   // TODO: draw size push const
     let dist = distance(vec2<f32>(coords), vec2<f32>(pc.force_pos));
-    let do_draw = f32(pc.pressed == 1);   // TODO: draw size push const
-    let new = vel_at(coords) + (do_draw * dt * size * pow(1.0/(dist+1.0),2.0) * pc.force_dir);
+    let do_draw = f32(pc.pressed == 1 && dist < range);
+    let new = vel_at(coords) + (do_draw * dt * pc.force_dir); // TODO: reimpl squared dropoff brush
     set_vel(coords, new);
 }
 
@@ -165,8 +166,7 @@ fn get_div(coords: vec2<u32>) -> f32 {
 }
 
 fn gausss(coords: vec2<u32>) {
-    // TODO: data race
-    // set_tmp_next(coords, tmp_at(coords));
+    // swap occurrs outside now
     let u = tmp_at(coords - vec2<u32>(0u, 1u));
     let d = tmp_at(coords + vec2<u32>(0u, 1u));
     let l = tmp_at(coords - vec2<u32>(1u, 0u));
@@ -196,15 +196,15 @@ fn confine_vort(coords: vec2<u32>) {
     let size = (pc.dimension);
     if (coords.x > 1u && coords.x < (size.x - 2u) && coords.y > 1u && coords.y < (size.y - 2u)) {
         let dt = pc.dt_s;
-        var v = 2.0;
+        var v = 5.0; // todo: push const this
         let vort_grad = vec2<f32>(
             abs(vel_curl_at(coords - vec2<u32>(0u,1u))) - abs(vel_curl_at(coords + vec2<u32>(0u,1u))),
             abs(vel_curl_at(coords + vec2<u32>(1u,0u))) - abs(vel_curl_at(coords - vec2<u32>(1u,0u)))
         );
-        let len = max(sqrt(vort_grad.x * vort_grad.x + vort_grad.y * vort_grad.y), 0.00001);
+        let len = max(sqrt(vort_grad.x * vort_grad.x + vort_grad.y * vort_grad.y), 0.0001);
         let vort_grad_norm = vort_grad / len;
-        let adjustment = vel_at(coords) + (dt * v * vel_curl_at(coords) * vort_grad_norm);
-        set_vel(coords, adjustment);
+        let adjusted = vel_at(coords) + (dt * v * vel_curl_at(coords) * vort_grad_norm);
+        set_vel_next(coords, adjusted);
     }
 }
 

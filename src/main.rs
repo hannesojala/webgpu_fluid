@@ -664,26 +664,28 @@ impl App {
         compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
 
         for _ in 0..timesteps {
-            // Pass: Advection
+            // Input
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::ForceInput)]));
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            // Advection
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::Advection)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapVel)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
-            // Pass: Confine Vorticity
+            // Confine Vorticity
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::VorticityConfinement)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
-            // Pass: Gauss-Seidel iteration
+            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapVel)]));
+            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
+            // Gauss-Seidel iterations
             for _ in 0..GAUSSS_QUAL {
                 compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::GaussSeidelIteration)]));
                 compute_pass.dispatch(dispatch_width, dispatch_height, 1);
                 compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::SwapTemp)]));
                 compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             }
-            // Pass: Remove divergence
+            // Remove divergence
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::RemoveDivergence)]));
-            compute_pass.dispatch(dispatch_width, dispatch_height, 1);
-            // Pass: Input
-            compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::ForceInput)]));
             compute_pass.dispatch(dispatch_width, dispatch_height, 1);
             // Advect Dye
             compute_pass.set_push_constants(0, util::to_raw(&[self.get_push_consts(FluidStage::AdvectDye)]));
@@ -753,7 +755,6 @@ impl App {
         self.sim_time.current_time = Instant::now();
         self.sim_time.accum_time += elapsed_time;
         println!("================\nelapsed: {elapsed_time:?}");
-        println!("Behind by: {:?}", self.sim_time.accum_time);
         if self.sim_time.accum_time > self.sim_time.timestep {
             self.sim_time.accum_time -= self.sim_time.timestep;
             self.update(1);
