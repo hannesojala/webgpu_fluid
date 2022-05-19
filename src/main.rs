@@ -8,6 +8,7 @@ use std::{
 };
 
 use image::{imageops::FilterType, EncodableLayout};
+use imgui::Ui;
 use pollster::block_on;
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -20,11 +21,11 @@ use wgpu::{
     PrimitiveState, PrimitiveTopology, PushConstantRange, Queue, RenderPipeline,
     RequestAdapterOptions, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages,
     Surface, SurfaceConfiguration, TextureDescriptor, TextureFormat, TextureSampleType,
-    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState, BufferAddress,
+    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{
     dpi::PhysicalSize,
-    event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
+    event::{ElementState, Event, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
@@ -62,6 +63,7 @@ struct SimTime {
     timestep: Duration,
     current_time: Instant,
     accum_time: Duration,
+    elapsed_time: Duration,
 }
 
 struct App {
@@ -88,12 +90,15 @@ struct App {
     mouse_down: bool,
     sim_time: SimTime,
     render_mode: RenderMode,
+    imgui: imgui::Context,
+    imgui_renderer: imgui_wgpu::Renderer,
+    imgui_platform: imgui_winit_support::WinitPlatform,
 }
 
 impl App {
     pub fn new(window: &Window) -> Self {
         // Create a new instance using he Vulkan backend
-        let instance = Instance::new(Backends::VULKAN);
+        let instance = Instance::new(Backends::PRIMARY);
         // Create a surface from the window (it implements RawWindowHandle)
         let surface = unsafe { instance.create_surface(&window) };
         // Try to get an adapter to a graphics device
@@ -101,8 +106,8 @@ impl App {
             power_preference: PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
-        }))
-        .expect("Failed to obtain adapter: ");
+        })).expect("No compatible adapter found! Check drivers!");
+        println!("adapter: {}", adapter.get_info().name);
         // Try to get a device and its associated queue
         let (device, queue) = block_on(adapter.request_device(
             &DeviceDescriptor {
@@ -120,7 +125,6 @@ impl App {
             None,
         ))
         .expect("Failed to obtain device: ");
-
         // Surface properties
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
@@ -130,6 +134,31 @@ impl App {
             present_mode: PresentMode::Immediate,
         };
         surface.configure(&device, &surface_config);
+
+        let mut imgui = imgui::Context::create();
+        let mut imgui_platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
+        imgui_platform.attach_window(
+            imgui.io_mut(),
+            window,
+            imgui_winit_support::HiDpiMode::Default,
+        );
+        imgui.set_ini_filename(None);
+        let hidpi_factor = window.scale_factor();
+        let font_size = (13.0 * hidpi_factor) as f32;
+        imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+        imgui.fonts().add_font(&[imgui::FontSource::DefaultFontData {
+            config: Some(imgui::FontConfig {
+                oversample_h: 1,
+                pixel_snap_h: true,
+                size_pixels: font_size,
+                ..Default::default()
+            }),
+        }]);
+        let imgui_renderer_config = imgui_wgpu::RendererConfig {
+            texture_format: surface_config.format,
+            ..Default::default()
+        };
+        let imgui_renderer = imgui_wgpu::Renderer::new(&mut imgui, &device, &queue, imgui_renderer_config);
 
         // Buffers
         // I know theres no reason to do this for a simple screen quad but I wanted
@@ -429,23 +458,23 @@ impl App {
         });
         App {
             surface,
+            surface_config,
             device,
             queue,
-            surface_config,
             vertex_buffer,
             index_buffer,
+            compute_bind_group,
+            compute_pipeline,
             vel_buff,
             dye_buff,
             temp_buff_0,
             temp_buff_1,
-            render_texture,
-            texture_size,
             texture_layout,
+            texture_size,
+            render_texture,
             render_texture_bind_group,
             vec_render_pipeline,
             dye_render_pipeline,
-            compute_bind_group,
-            compute_pipeline,
             mouse_pos: (0.0,0.0),
             mouse_del: (0.0,0.0),
             mouse_down: false,
@@ -453,8 +482,12 @@ impl App {
                 timestep: Duration::from_secs_f32(TIMESTEP_SECONDS),
                 current_time: Instant::now(),
                 accum_time: Duration::ZERO,
+                elapsed_time: Duration::ZERO,
             },
             render_mode: RenderMode::Dye,
+            imgui, 
+            imgui_renderer,
+            imgui_platform,
         }
     }
 
@@ -465,11 +498,61 @@ impl App {
     }
 
     // Begins the render pass using the provided texture view and draws
-    fn render_pass(&self, encoder: &mut CommandEncoder, texture_view: &TextureView) {
+    fn render_pass(&mut self, encoder: &mut CommandEncoder, texture_view: &TextureView, ui: Ui) {
+    }
+
+    fn render(&mut self, window: &Window) {
+        // Get next swapchain texture
+        let swapchain_texture = self
+            .surface
+            .get_current_texture()
+            .expect("Failed to obtain next swapchain image");
+        //
+        self.imgui_platform
+            .prepare_frame(self.imgui.io_mut(), &window)
+            .expect("Failed to prepare frame");
+        //
+        let ui = self.imgui.frame();
+        {
+            let window = imgui::Window::new("Hello world");
+            window
+                .size([300.0, 100.0], imgui::Condition::FirstUseEver)
+                .build(&ui, || {
+                    ui.text("Hello world!");
+                    ui.text("This...is...imgui-rs on WGPU!");
+                    ui.separator();
+                    let mouse_pos = ui.io().mouse_pos;
+                    ui.text(format!(
+                        "Mouse Position: ({:.1},{:.1})",
+                        mouse_pos[0], mouse_pos[1]
+                    ));
+                });
+
+            let window = imgui::Window::new("Hello too");
+            window
+                .size([400.0, 200.0], imgui::Condition::FirstUseEver)
+                .position([400.0, 200.0], imgui::Condition::FirstUseEver)
+                .build(&ui, || {
+                    ui.text(format!("Frametime: {:?}", self.sim_time.elapsed_time));
+                });
+
+            ui.show_demo_window(&mut true);
+        }
+        // Create a texture view of the swapchain texture
+        let swapchain_texture_view = swapchain_texture
+            .texture
+            .create_view(&TextureViewDescriptor::default());
+        // Create a command encoder
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+        // Encode a RenderPass on that encoder that draws onto that texture view
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[wgpu::RenderPassColorAttachment {
-                view: texture_view,
+                view: &swapchain_texture_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::RED),
@@ -487,26 +570,8 @@ impl App {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
         render_pass.draw_indexed(0..6, 0, 0..1);
-    }
-
-    fn render(&mut self) {
-        // Get next swapchain texture
-        let swapchain_texture = self
-            .surface
-            .get_current_texture()
-            .expect("Failed to obtain next swapchain image: ");
-        // Create a texture view of the swapchain texture
-        let swapchain_texture_view = swapchain_texture
-            .texture
-            .create_view(&TextureViewDescriptor::default());
-        // Create a command encoder
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-        // Encode a RenderPass on that encoder that draws onto that texture view
-        self.render_pass(&mut encoder, &swapchain_texture_view);
+        self.imgui_renderer.render(ui.render(), &self.queue, &self.device, &mut render_pass);
+        drop(render_pass);
         // Submit the command buffer recieved from the encoder to the queue
         self.queue.submit([encoder.finish()]);
         // Present to screen
@@ -604,6 +669,7 @@ impl App {
     // returns the amount of accumulated timesteps to simulate
     fn perf(&mut self) -> u32 {
         let elapsed_time = self.sim_time.current_time.elapsed();
+        self.imgui.io_mut().update_delta_time(elapsed_time);
         self.sim_time.current_time = Instant::now();
         self.sim_time.accum_time += elapsed_time;
         let mut num_timesteps = 0;
@@ -622,7 +688,7 @@ impl App {
 
     // For some purposes in the future (unlikely for this application), device
     // events may be preferred for things like raw mouse delta or kb state.
-    fn handle_window_event(&mut self, event: &WindowEvent) -> ControlFlow {
+    fn handle_window_event(&mut self, event: &WindowEvent, window: &Window) -> ControlFlow {
         match event {
             WindowEvent::CloseRequested => return ControlFlow::Exit,
             WindowEvent::KeyboardInput {input, ..} => {
@@ -654,10 +720,10 @@ impl App {
         ControlFlow::Poll
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, window: &Window) {
         let timesteps = self.perf();
         self.update(timesteps);
-        self.render();
+        self.render(window);
         self.mouse_del = (0.0,0.0);
     }
 }
@@ -665,17 +731,19 @@ impl App {
 fn main() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
+        .with_title("Fluid")
         .with_inner_size(PhysicalSize::new(SIMULATION_SIZE as u32, SIMULATION_SIZE as u32))
         .build(&event_loop)
         .unwrap();
     let mut app = App::new(&window);
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
-                *control_flow = app.handle_window_event(&event)
+                *control_flow = app.handle_window_event(&event, &window)
             }
-            Event::MainEventsCleared => app.run(),
+            Event::MainEventsCleared => app.run(&window),
             _ => {}
         }
     });
