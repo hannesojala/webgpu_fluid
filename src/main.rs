@@ -527,7 +527,7 @@ impl App {
             .expect("Failed to prepare frame");
         let ui = self.imgui_context.frame();
         {
-            imgui::Window::new("Options (Collapsable)")
+            imgui::Window::new("Options (Collapsible)")
             .collapsed(true, imgui::Condition::FirstUseEver)
             .size_constraints([300.0, WINDOW_SIZE as f32], [WINDOW_SIZE as f32,WINDOW_SIZE as f32])
             .position([0.0, 0.0], imgui::Condition::Always)
@@ -561,6 +561,15 @@ impl App {
                     imgui::Slider::new("Vorticity", 0.0, 5.0)
                         .display_format("%.2f")
                         .build(&ui, &mut self.vort);
+                    imgui::Slider::new("Viscosity (TODO)", 0.0, 5.0)
+                        .display_format("%.2f")
+                        .build(&ui, &mut 0.0);
+                    imgui::Slider::new("Quality (TODO)", 5, 100)
+                        .display_format("%d")
+                        .build(&ui, &mut 50);
+                    imgui::Slider::new("Per Second (TODO)", 30, 144)
+                        .display_format("%d")
+                        .build(&ui, &mut 100);
                 });
             });
         }
