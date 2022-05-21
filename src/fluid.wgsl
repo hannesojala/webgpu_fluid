@@ -6,13 +6,17 @@ struct F32Arr {
     data: array<f32>;
 };
 
-struct PushConstants {
+struct PushConst {
+    draw_color: vec4<f32>;
     dimension: vec2<u32>;
     force_pos: vec2<i32>;
     force_dir: vec2<f32>;
-    pressed: i32;
+    draw_size: f32;
     dt_s: f32;
+    vort: f32;
     stage: u32;
+    draw_dye: u32;
+    push_vel: u32;
 };
 
 [[group(0), binding(0)]] var<storage, read_write> vel_arr: Vec4Arr;
@@ -22,7 +26,7 @@ struct PushConstants {
 [[group(0), binding(4)]] var<storage, read_write> tmp_arr: F32Arr;
 [[group(0), binding(5)]] var<storage, read_write> tmp_tmp: F32Arr;
 
-var<push_constant> pc: PushConstants;
+var<push_constant> pc: PushConst;
 
 fn idx(coords: vec2<u32>) -> u32 {
     return coords.x + u32(pc.dimension.x) * coords.y;
@@ -114,11 +118,17 @@ fn bound(coords: vec2<u32>) {
 fn add_input(coords: vec2<u32>) {
     let dt = pc.dt_s;
     let size = vec2<f32>(pc.dimension);
-    let range = max(size.x, size.y) / 32.0;   // TODO: draw size push const
+    let range = max(size.x, size.y) * pc.draw_size / (100.0 * 16.0);
     let dist = distance(vec2<f32>(coords), vec2<f32>(pc.force_pos));
-    let do_draw = f32(pc.pressed == 1 && dist < range);
-    let new = vel_at(coords) + (do_draw * dt * pc.force_dir); // TODO: reimpl squared dropoff brush
-    set_vel(coords, new);
+    let do_draw = dist < range;
+    if (bool(pc.push_vel) && do_draw) {
+        let new_vel = vel_at(coords) + (dt * pc.force_dir); // TODO: reimpl squared dropoff brush
+        set_vel(coords, new_vel);
+    }
+    if (bool(pc.draw_dye) && do_draw) {
+        let new_dye = pc.draw_color;
+        set_dye(coords, new_dye);
+    }
 }
 
 fn advect(coords: vec2<u32>) {
@@ -196,7 +206,7 @@ fn confine_vort(coords: vec2<u32>) {
     let size = (pc.dimension);
     if (coords.x > 1u && coords.x < (size.x - 2u) && coords.y > 1u && coords.y < (size.y - 2u)) {
         let dt = pc.dt_s;
-        var v = 5.0; // todo: push const this
+        var v = pc.vort;
         let vort_grad = vec2<f32>(
             abs(vel_curl_at(coords - vec2<u32>(0u,1u))) - abs(vel_curl_at(coords + vec2<u32>(0u,1u))),
             abs(vel_curl_at(coords + vec2<u32>(1u,0u))) - abs(vel_curl_at(coords - vec2<u32>(1u,0u)))

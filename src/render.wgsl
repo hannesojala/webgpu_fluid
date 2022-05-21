@@ -1,5 +1,3 @@
-// Vertex shader
-
 struct VertexInput {
     [[location(0)]] position: vec3<f32>;
     [[location(1)]] tex_coord: vec2<f32>;
@@ -20,18 +18,19 @@ fn vs_main(
     return out;
 }
 
-// Fragment shader
-
 [[group(0), binding(0)]] var tex: texture_2d<f32>;
 [[group(0), binding(1)]] var samp: sampler;
 
 [[stage(fragment)]]
 fn vel_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
     let vel = textureSample(tex, samp, in.tex_coord);
+    let len = length(vec2<f32>(vel.x,vel.y));
     let r = abs(clamp(vel.x,  0.0, 1.0));
     let g = (abs(clamp(vel.x, -1.0, 0.0)) + abs(clamp(vel.y,  0.0, 1.0))) / 2.0;
     let b = abs(clamp(vel.y, -1.0, 0.0));
-    return vec4<f32>(r,g,b, 1.0);
+    let color = vec4<f32>(r,g,b, 1.0);
+    let color = sqrt(color);
+    return color;
 }
 
 [[stage(fragment)]]
