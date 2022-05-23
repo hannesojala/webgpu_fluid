@@ -561,15 +561,18 @@ impl App {
                     imgui::Slider::new("Vorticity", 0.0, 5.0)
                         .display_format("%.2f")
                         .build(&ui, &mut self.vort);
-                    imgui::Slider::new("Viscosity (TODO)", 0.0, 5.0)
+                    ui.separator();
+                    ui.text("Not Yet Implemented");
+                    imgui::Slider::new("Viscosity", 0.0, 5.0)
                         .display_format("%.2f")
                         .build(&ui, &mut 0.0);
-                    imgui::Slider::new("Quality (TODO)", 5, 100)
+                    imgui::Slider::new("Quality", 5, 100)
                         .display_format("%d")
                         .build(&ui, &mut 50);
-                    imgui::Slider::new("Per Second (TODO)", 30, 144)
+                    imgui::Slider::new("Timestep (FPS)", 30, 144)
                         .display_format("%d")
                         .build(&ui, &mut 100);
+                    ui.text("- Pressure Poisson")
                 });
             });
         }
