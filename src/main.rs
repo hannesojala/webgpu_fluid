@@ -34,8 +34,6 @@ use winit::{
 const WINDOW_SIZE: u32 = 800;
 const SIM_SIZE: usize = 800;
 const WG_SIZE: usize = 32;
-const DT_S: f32 = 1.0 / 100.;
-const QUAL: u32 = 50;
 
 #[repr(C)]
 struct PushConst {
@@ -84,7 +82,7 @@ struct App {
     render_texture_bind_group: BindGroup,
     vel_render_pipeline: RenderPipeline,
     dye_render_pipeline: RenderPipeline,
-    timestep: Duration,
+    timestep_ms: u64, // controlled by UI, converted to Duration for use
     current_time: Instant,
     accum_time: Duration,
     elapsed_time: Duration,
@@ -101,6 +99,7 @@ struct App {
     draw_dye: bool,
     push_vel: bool,
     vort: f32,
+    qual: u32,
 }
 
 impl App {
@@ -190,7 +189,7 @@ impl App {
         let dye_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: gorilla.as_bytes(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         });
         let dye_tmp_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("dye_tmp_buff"),
@@ -491,7 +490,7 @@ impl App {
             render_texture_bind_group,
             vel_render_pipeline,
             dye_render_pipeline,
-            timestep: Duration::from_secs_f32(DT_S),
+            timestep_ms: 1000/60,
             current_time: Instant::now(),
             accum_time: Duration::ZERO,
             elapsed_time: Duration::ZERO,
@@ -504,10 +503,11 @@ impl App {
             mouse_down: false,
             push_power: 5.0,
             draw_size: 50.0,
-            draw_color: [0.,0.,0.,0.,],
+            draw_color: [0.7,0.4,0.4,1.,],
             draw_dye: true,
             push_vel: true,
             vort: 5.0,
+            qual: 100,
         }
     }
 
@@ -555,6 +555,7 @@ impl App {
                     imgui::ColorPicker::new("Dye Color", &mut self.draw_color)
                         .build(&ui);
                     ui.separator();
+                    ui.text_wrapped("Try dragging and dropping a png into this window!");
 
                     ui.text("Parameters");
                     ui.set_next_item_width(-100.0);
@@ -562,17 +563,15 @@ impl App {
                         .display_format("%.2f")
                         .build(&ui, &mut self.vort);
                     ui.separator();
-                    ui.text("Not Yet Implemented");
-                    imgui::Slider::new("Viscosity", 0.0, 5.0)
-                        .display_format("%.2f")
-                        .build(&ui, &mut 0.0);
-                    imgui::Slider::new("Quality", 5, 100)
+
+                    imgui::Slider::new("Quality", 5, 150)
                         .display_format("%d")
-                        .build(&ui, &mut 50);
-                    imgui::Slider::new("Timestep (FPS)", 30, 144)
+                        .build(&ui, &mut self.qual);
+                    imgui::Slider::new("Timestep (ms)", 1, 100)
                         .display_format("%d")
-                        .build(&ui, &mut 100);
-                    ui.text("- Pressure Poisson")
+                        .build(&ui, &mut self.timestep_ms);
+
+                    ui.text_wrapped("Upcoming features: Pressure Poisson, more sliders");
                 });
             });
         }
@@ -632,7 +631,7 @@ impl App {
             force_pos,
             force_dir,
             draw_size: self.draw_size,
-            dt_s: self.timestep.as_secs_f32(),
+            dt_s: Duration::from_millis(self.timestep_ms).as_secs_f32(),
             vort: self.vort,
             stage: stage as u32,
             draw_dye: (!over_ui && self.draw_dye && self.mouse_down) as u32,
@@ -662,8 +661,8 @@ impl App {
             });
             compute_pass.set_pipeline(&self.compute_pipeline);
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let timesteps = if self.accum_time > self.timestep {
-                self.accum_time -= self.timestep;
+            let timesteps = if self.accum_time > Duration::from_millis(self.timestep_ms) {
+                self.accum_time -= Duration::from_millis(self.timestep_ms);
                 1
             } else {
                 0
@@ -680,7 +679,7 @@ impl App {
                 compute_pass.dispatch(dispatch_x, dispatch_y, 1);
                 compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::SwapVel)]));
                 compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                for _ in 0..QUAL {
+                for _ in 0..self.qual {
                     compute_pass
                         .set_push_constants(0, to_raw(&[self.get_push_const(Stage::Project)]));
                     compute_pass.dispatch(dispatch_x, dispatch_y, 1);
@@ -739,6 +738,23 @@ impl App {
                 winit::event::MouseButton::Left => self.mouse_down = *state == ElementState::Pressed,
                 _ => {}
             },
+            WindowEvent::DroppedFile(filename, ..) => {
+                let image = image::open(filename);
+                if let Ok(image) = image {
+                    let image = image.resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest);
+                    let image = image.into_rgba32f();
+                    let new_dye_buff = self.device.create_buffer_init(&BufferInitDescriptor {
+                        label: Some("vel_buff"),
+                        contents: image.as_bytes(),
+                        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                    });
+                    let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("Compute Encoder"),
+                    });
+                    encoder.copy_buffer_to_buffer(&new_dye_buff, 0, &self.dye_buff, 0, image.as_bytes().len() as u64);
+                    self.queue.submit([encoder.finish()])
+                }
+            }
             _ => {}
         };
         ControlFlow::Poll
