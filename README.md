@@ -10,3 +10,5 @@ To compile:
 
 2. Build and run with `cargo run --release`
 3. Mess around
+
+Note: You must have a gpu capable of enough compute workgroups for this project to work.
