@@ -62,6 +62,8 @@ enum Stage {
 }
 
 struct App {
+    event_loop: Option<EventLoop<()>>,
+    window: Window,
     surface: Surface,
     surface_config: SurfaceConfiguration,
     device: Device,
@@ -103,7 +105,14 @@ struct App {
 }
 
 impl App {
-    pub fn new(window: &Window) -> Self {
+    pub fn new() -> Self {
+        let event_loop = EventLoop::new();
+        let window = WindowBuilder::new()
+            .with_title("Fluid")
+            .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
+            .with_resizable(false)
+            .build(&event_loop)
+            .unwrap();
         let instance = Instance::new(Backends::PRIMARY);
         let surface = unsafe { instance.create_surface(&window) };
         let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
@@ -139,7 +148,7 @@ impl App {
         let mut imgui_platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
         imgui_platform.attach_window(
             imgui.io_mut(),
-            window,
+            &window,
             imgui_winit_support::HiDpiMode::Default,
         );
         imgui.set_ini_filename(None);
@@ -470,6 +479,8 @@ impl App {
             multiview: None,
         });
         App {
+            event_loop: Some(event_loop),
+            window,
             surface,
             surface_config,
             device,
@@ -517,13 +528,13 @@ impl App {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn render(&mut self, window: &Window) {
+    fn render(&mut self) {
         let swapchain_texture = self
             .surface
             .get_current_texture()
             .expect("Failed to obtain next swapchain image");
         self.imgui_platform
-            .prepare_frame(self.imgui_context.io_mut(), window)
+            .prepare_frame(self.imgui_context.io_mut(), &self.window)
             .expect("Failed to prepare frame");
         let ui = self.imgui_context.frame();
         {
@@ -575,7 +586,7 @@ impl App {
                 });
             });
         }
-        self.imgui_platform.prepare_render(&ui, window);
+        self.imgui_platform.prepare_render(&ui, &self.window);
         let swapchain_texture_view = swapchain_texture
             .texture
             .create_view(&TextureViewDescriptor::default());
@@ -760,35 +771,29 @@ impl App {
         ControlFlow::Poll
     }
 
-    fn handle_event(&mut self, event: Event<()>, control_flow: &mut ControlFlow, window: &Window) {
-        self.imgui_platform
-            .handle_event(self.imgui_context.io_mut(), &window, &event);
-        *control_flow = ControlFlow::Poll;
-        match event {
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == window.id() => *control_flow = self.handle_window_event(event),
-            Event::MainEventsCleared => {
-                self.perf_update();
-                self.update();
-                self.render(&window);
+    fn run(mut self) {
+        let handler = self.event_loop.take().unwrap();
+        handler.run(move |event, _, control_flow| {
+            self.imgui_platform
+                .handle_event(self.imgui_context.io_mut(), &self.window, &event);
+            *control_flow = ControlFlow::Poll;
+            match event {
+                Event::WindowEvent {
+                    ref event,
+                    window_id,
+                } if window_id == self.window.id() => *control_flow = self.handle_window_event(event),
+                Event::MainEventsCleared => {
+                    self.perf_update();
+                    self.update();
+                    self.render();
+                }
+                _ => {}
             }
-            _ => {}
-        }
+        });
     }
 }
 
 fn main() {
-    let event_loop = EventLoop::new(); // TODO: Move into App
-    let window = WindowBuilder::new()
-        .with_title("Fluid")
-        .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
-        .with_resizable(false)
-        .build(&event_loop)
-        .unwrap();
-    let mut app = App::new(&window);
-    event_loop.run(move |event, _, control_flow| {
-        app.handle_event(event, control_flow, &window)
-    });
+    let app = App::new();
+    app.run();
 }
