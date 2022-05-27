@@ -503,7 +503,7 @@ impl App {
             mouse_down: false,
             push_power: 5.0,
             draw_size: 50.0,
-            draw_color: [0.7,0.4,0.4,1.,],
+            draw_color: [0.0,1.0,0.0,1.0,],
             draw_dye: true,
             push_vel: true,
             vort: 5.0,
