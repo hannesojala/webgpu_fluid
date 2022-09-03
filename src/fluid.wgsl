@@ -1,12 +1,12 @@
-struct Vec4Arr {
+struct Vec4Array {
     data: array<vec4<f32>>;
 };
 
-struct F32Arr {
+struct F32Array {
     data: array<f32>;
 };
 
-struct PushConst {
+struct PushConstant {
     draw_color: vec4<f32>;
     dimension: vec2<u32>;
     force_pos: vec2<i32>;
@@ -19,14 +19,14 @@ struct PushConst {
     push_vel: u32;
 };
 
-[[group(0), binding(0)]] var<storage, read_write> vel_arr: Vec4Arr;
-[[group(0), binding(1)]] var<storage, read_write> vel_tmp: Vec4Arr;
-[[group(0), binding(2)]] var<storage, read_write> dye_arr: Vec4Arr;
-[[group(0), binding(3)]] var<storage, read_write> dye_tmp: Vec4Arr;
-[[group(0), binding(4)]] var<storage, read_write> tmp_arr: F32Arr;
-[[group(0), binding(5)]] var<storage, read_write> tmp_tmp: F32Arr;
+[[group(0), binding(0)]] var<storage, read_write> vel_arr: Vec4Array;
+[[group(0), binding(1)]] var<storage, read_write> vel_tmp: Vec4Array;
+[[group(0), binding(2)]] var<storage, read_write> dye_arr: Vec4Array;
+[[group(0), binding(3)]] var<storage, read_write> dye_tmp: Vec4Array;
+[[group(0), binding(4)]] var<storage, read_write> tmp_arr: F32Array;
+[[group(0), binding(5)]] var<storage, read_write> tmp_tmp: F32Array;
 
-var<push_constant> pc: PushConst;
+var<push_constant> pc: PushConstant;
 
 fn idx(coords: vec2<u32>) -> u32 {
     return coords.x + u32(pc.dimension.x) * coords.y;
@@ -148,7 +148,7 @@ fn advect(coords: vec2<u32>) {
     let blerped = blerp(s0,s1,s2,s3,fract(pos_0));
     set_vel_next(coords, blerped);
 }
-// TODO: merge?
+// TODO: merge stages!
 fn advect_dye(coords: vec2<u32>) {
     let size = vec2<f32>(pc.dimension);
     let dt = pc.dt_s;

@@ -4,6 +4,7 @@ mod vertex;
 use std::{
     mem,
     num::NonZeroU32,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -21,22 +22,23 @@ use wgpu::{
     PrimitiveState, PrimitiveTopology, PushConstantRange, Queue, RenderPipeline,
     RequestAdapterOptions, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages,
     Surface, SurfaceConfiguration, Texture, TextureDescriptor, TextureFormat, TextureSampleType,
-    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState,
+    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, ComputePass,
 };
 use winit::{
-    dpi::{PhysicalSize},
-    event::{ElementState, Event, WindowEvent},
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{DeviceId, ElementState, Event, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
+    window::{Window, WindowBuilder, WindowId},
 };
 
 // TODO: MAKE DYNAMIC & CHANGE-ABLE IN UI
 const WINDOW_SIZE: u32 = 800;
 const SIM_SIZE: usize = 800;
 const WG_SIZE: usize = 32;
+const TARGET_FRAME_TIME: Duration = Duration::from_millis(1000/144);
 
 #[repr(C)]
-struct PushConst {
+struct FluidPushConstant {
     draw_color: [f32; 4],
     dimension: (u32, u32),
     force_pos: (i32, i32),
@@ -50,12 +52,12 @@ struct PushConst {
 }
 
 enum Stage {
-    AdvectVel = 0,
-    SwapVel = 1,
-    VortConf = 2,
+    AdvectVelocity = 0,
+    SwapVelocity = 1,
+    VorticityConfinement = 2,
     Project = 3,
     SwapTmp = 4,
-    RemDiv = 5,
+    RemoveDivergence = 5,
     Input = 6,
     AdvectDye = 7,
     SwapDye = 8,
@@ -97,7 +99,7 @@ struct App {
     mouse_down: bool,
     push_power: f32,
     draw_size: f32,
-    draw_color: [f32;4],
+    draw_color: [f32; 4],
     draw_dye: bool,
     push_vel: bool,
     vort: f32,
@@ -126,7 +128,7 @@ impl App {
                 label: Some("Device"),
                 features: Features::PUSH_CONSTANTS,
                 limits: Limits {
-                    max_push_constant_size: std::mem::size_of::<PushConst>() as u32,
+                    max_push_constant_size: std::mem::size_of::<FluidPushConstant>() as u32,
                     max_compute_workgroup_size_x: WG_SIZE as u32,
                     max_compute_workgroup_size_y: WG_SIZE as u32,
                     max_compute_invocations_per_workgroup: (WG_SIZE * WG_SIZE) as u32,
@@ -193,8 +195,9 @@ impl App {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let gorilla = image::open("gorilla.png").expect("No gorilla :(");
-        let gorilla = gorilla.resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest);
-        let gorilla = gorilla.into_rgba32f();
+        let gorilla = gorilla
+            .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
+            .into_rgba32f();
         let dye_buff = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: gorilla.as_bytes(),
@@ -352,7 +355,7 @@ impl App {
         });
         let compute_push_constant_range = PushConstantRange {
             stages: ShaderStages::COMPUTE,
-            range: 0..std::mem::size_of::<PushConst>() as u32,
+            range: 0..std::mem::size_of::<FluidPushConstant>() as u32,
         };
         let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("main pipeline"),
@@ -478,6 +481,7 @@ impl App {
             },
             multiview: None,
         });
+        // todo: impl Default
         App {
             event_loop: Some(event_loop),
             window,
@@ -501,7 +505,7 @@ impl App {
             render_texture_bind_group,
             vel_render_pipeline,
             dye_render_pipeline,
-            timestep_ms: 1000/60,
+            timestep_ms: 1000 / 60,
             current_time: Instant::now(),
             accum_time: Duration::ZERO,
             elapsed_time: Duration::ZERO,
@@ -514,7 +518,7 @@ impl App {
             mouse_down: false,
             push_power: 5.0,
             draw_size: 50.0,
-            draw_color: [0.0,1.0,0.0,1.0,],
+            draw_color: [0.0, 1.0, 0.0, 1.0],
             draw_dye: true,
             push_vel: true,
             vort: 5.0,
@@ -539,52 +543,54 @@ impl App {
         let ui = self.imgui_context.frame();
         {
             imgui::Window::new("Options (Collapsible)")
-            .collapsed(true, imgui::Condition::FirstUseEver)
-            .size_constraints([300.0, WINDOW_SIZE as f32], [WINDOW_SIZE as f32,WINDOW_SIZE as f32])
-            .position([0.0, 0.0], imgui::Condition::Always)
-            .build(&ui, ||{
-                ui.group(||{
-                    ui.text("View Mode");
-                    ui.radio_button("View Dye", &mut self.render_mode, false);
-                    ui.radio_button("View Velocity", &mut self.render_mode, true);
-                    ui.separator();
+                .collapsed(true, imgui::Condition::FirstUseEver)
+                .size_constraints(
+                    [300.0, WINDOW_SIZE as f32],
+                    [WINDOW_SIZE as f32, WINDOW_SIZE as f32],
+                )
+                .position([0.0, 0.0], imgui::Condition::Always)
+                .build(&ui, || {
+                    ui.group(|| {
+                        ui.text("View Mode");
+                        ui.radio_button("View Dye", &mut self.render_mode, false);
+                        ui.radio_button("View Velocity", &mut self.render_mode, true);
+                        ui.separator();
 
-                    ui.text("Mouse Action");
-                    ui.checkbox("Push Fluid", &mut self.push_vel);
-                    ui.checkbox("Drop Dye", &mut self.draw_dye);
-                    ui.separator();
+                        ui.text("Mouse Action");
+                        ui.checkbox("Push Fluid", &mut self.push_vel);
+                        ui.checkbox("Drop Dye", &mut self.draw_dye);
+                        ui.separator();
 
-                    ui.text("Input");
-                    ui.set_next_item_width(-100.0);
-                    imgui::Slider::new("Draw Size", 0.0, 100.0)
-                        .display_format("%.2f")
-                        .build(&ui, &mut self.draw_size);
-                    ui.set_next_item_width(-100.0);
-                    imgui::Slider::new("Push Strength", 0.0, 10.0)
-                        .display_format("%.2f")
-                        .build(&ui, &mut self.push_power);
-                    imgui::ColorPicker::new("Dye Color", &mut self.draw_color)
-                        .build(&ui);
-                    ui.separator();
-                    ui.text_wrapped("Try dragging and dropping a png into this window!");
+                        ui.text("Input");
+                        ui.set_next_item_width(-100.0);
+                        imgui::Slider::new("Draw Size", 0.0, 100.0)
+                            .display_format("%.2f")
+                            .build(&ui, &mut self.draw_size);
+                        ui.set_next_item_width(-100.0);
+                        imgui::Slider::new("Push Strength", 0.0, 10.0)
+                            .display_format("%.2f")
+                            .build(&ui, &mut self.push_power);
+                        imgui::ColorPicker::new("Dye Color", &mut self.draw_color).build(&ui);
+                        ui.separator();
+                        ui.text_wrapped("Try dragging and dropping a png into this window!");
 
-                    ui.text("Parameters");
-                    ui.set_next_item_width(-100.0);
-                    imgui::Slider::new("Vorticity", 0.0, 5.0)
-                        .display_format("%.2f")
-                        .build(&ui, &mut self.vort);
-                    ui.separator();
+                        ui.text("Parameters");
+                        ui.set_next_item_width(-100.0);
+                        imgui::Slider::new("Vorticity", 0.0, 5.0)
+                            .display_format("%.2f")
+                            .build(&ui, &mut self.vort);
+                        ui.separator();
 
-                    imgui::Slider::new("Quality", 5, 150)
-                        .display_format("%d")
-                        .build(&ui, &mut self.qual);
-                    imgui::Slider::new("Timestep (ms)", 1, 100)
-                        .display_format("%d")
-                        .build(&ui, &mut self.timestep_ms);
+                        imgui::Slider::new("Quality", 5, 150)
+                            .display_format("%d")
+                            .build(&ui, &mut self.qual);
+                        imgui::Slider::new("Timestep (ms)", 1, 100)
+                            .display_format("%d")
+                            .build(&ui, &mut self.timestep_ms);
 
-                    ui.text_wrapped("Upcoming features: Pressure Poisson, more sliders");
+                        ui.text_wrapped("Upcoming features: Pressure Poisson, more sliders");
+                    });
                 });
-            });
         }
         self.imgui_platform.prepare_render(&ui, &self.window);
         let swapchain_texture_view = swapchain_texture
@@ -625,18 +631,19 @@ impl App {
         swapchain_texture.present();
     }
 
-    fn get_push_const(&self, stage: Stage) -> PushConst {
+    fn push_constant(&self, stage: Stage) -> Vec<u8> {
         let force_pos = (
             self.mouse_pos.0 as i32 * SIM_SIZE as i32 / self.surface_config.width as i32,
             self.mouse_pos.1 as i32 * SIM_SIZE as i32 / self.surface_config.height as i32,
         );
-        let del_len = (self.mouse_del.0 * self.mouse_del.0 + self.mouse_del.1 * self.mouse_del.1).sqrt();
+        let del_len =
+            (self.mouse_del.0 * self.mouse_del.0 + self.mouse_del.1 * self.mouse_del.1).sqrt();
         let force_dir = (
             self.push_power * (del_len * del_len * self.mouse_del.0) as f32,
             self.push_power * (del_len * del_len * self.mouse_del.1) as f32,
         );
         let over_ui = self.imgui_context.io().want_capture_mouse;
-        PushConst {
+        to_raw(&[FluidPushConstant {
             draw_color: self.draw_color,
             dimension: (SIM_SIZE as u32, SIM_SIZE as u32),
             force_pos,
@@ -647,7 +654,8 @@ impl App {
             stage: stage as u32,
             draw_dye: (!over_ui && self.draw_dye && self.mouse_down) as u32,
             push_vel: (!over_ui && self.push_vel && self.mouse_down) as u32,
-        }
+        }])
+        .to_owned()
     }
 
     fn clear_buffers(&mut self, encoder: &mut CommandEncoder) {
@@ -657,9 +665,15 @@ impl App {
         encoder.clear_buffer(&self.tmp_buff_1, 0, None);
     }
 
-    fn update(&mut self) {
+    fn dispatch_stage(&self, compute_pass: &mut ComputePass, stage: Stage) {
         let (dispatch_x, dispatch_y) =
             util::dispatch_size((SIM_SIZE, SIM_SIZE), (WG_SIZE, WG_SIZE));
+        compute_pass.set_push_constants(0, &self.push_constant(stage));
+        compute_pass.dispatch(dispatch_x, dispatch_y, 1);
+    }
+
+    // TODO: Seperate thread
+    fn update(&mut self) {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -672,41 +686,24 @@ impl App {
             });
             compute_pass.set_pipeline(&self.compute_pipeline);
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let timesteps = if self.accum_time > Duration::from_millis(self.timestep_ms) {
+            self.dispatch_stage(&mut compute_pass, Stage::Input);
+            // todo: move loop to outer function
+            while self.accum_time > Duration::from_millis(self.timestep_ms) {
                 self.accum_time -= Duration::from_millis(self.timestep_ms);
-                1
-            } else {
-                0
-            };
-            for _ in 0..timesteps {
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::Input)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass
-                    .set_push_constants(0, to_raw(&[self.get_push_const(Stage::AdvectVel)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::SwapVel)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::VortConf)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::SwapVel)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
+                self.dispatch_stage(&mut compute_pass, Stage::AdvectVelocity);
+                self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
+                self.dispatch_stage(&mut compute_pass, Stage::VorticityConfinement);
+                self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
                 for _ in 0..self.qual {
-                    compute_pass
-                        .set_push_constants(0, to_raw(&[self.get_push_const(Stage::Project)]));
-                    compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                    compute_pass
-                        .set_push_constants(0, to_raw(&[self.get_push_const(Stage::SwapTmp)]));
-                    compute_pass.dispatch(dispatch_x, dispatch_y, 1);
+                    self.dispatch_stage(&mut compute_pass, Stage::Project);
+                    self.dispatch_stage(&mut compute_pass, Stage::SwapTmp);
                 }
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::RemDiv)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass
-                    .set_push_constants(0, to_raw(&[self.get_push_const(Stage::AdvectDye)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
-                compute_pass.set_push_constants(0, to_raw(&[self.get_push_const(Stage::SwapDye)]));
-                compute_pass.dispatch(dispatch_x, dispatch_y, 1);
+                self.dispatch_stage(&mut compute_pass, Stage::RemoveDivergence);
+                self.dispatch_stage(&mut compute_pass, Stage::AdvectDye);
+                self.dispatch_stage(&mut compute_pass, Stage::SwapDye);
             }
         }
+        // todo: Move out of update
         let buff_to_render = if self.render_mode {
             &self.vel_buff
         } else {
@@ -737,37 +734,69 @@ impl App {
             .update_delta_time(self.elapsed_time);
     }
 
-    fn handle_window_event(&mut self, event: &WindowEvent) -> ControlFlow {
-        match event {
-            WindowEvent::CloseRequested => return ControlFlow::Exit,
-            WindowEvent::Resized(size) => self.resize_surface(*size),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_del = (position.x - self.mouse_pos.0, position.y - self.mouse_pos.1);
-                self.mouse_pos = (position.x, position.y);
-            }
-            WindowEvent::MouseInput { button, state, .. } => match button {
-                winit::event::MouseButton::Left => self.mouse_down = *state == ElementState::Pressed,
-                _ => {}
-            },
-            WindowEvent::DroppedFile(filename, ..) => {
-                let image = image::open(filename);
-                if let Ok(image) = image {
-                    let image = image.resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest);
-                    let image = image.into_rgba32f();
-                    let new_dye_buff = self.device.create_buffer_init(&BufferInitDescriptor {
-                        label: Some("vel_buff"),
-                        contents: image.as_bytes(),
-                        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-                    });
-                    let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-                        label: Some("Compute Encoder"),
-                    });
-                    encoder.copy_buffer_to_buffer(&new_dye_buff, 0, &self.dye_buff, 0, image.as_bytes().len() as u64);
-                    self.queue.submit([encoder.finish()])
-                }
-            }
+    fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>, _device_id: DeviceId) {
+        self.mouse_del = (position.x - self.mouse_pos.0, position.y - self.mouse_pos.1);
+        self.mouse_pos = (position.x, position.y);
+    }
+
+    fn handle_mouse_input(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        _device_id: DeviceId,
+    ) {
+        match button {
+            winit::event::MouseButton::Left => self.mouse_down = state == ElementState::Pressed,
             _ => {}
-        };
+        }
+    }
+
+    fn handle_dropped_file(&mut self, path: &Path) {
+        let image = image::open(path);
+        if let Ok(image) = image {
+            let image = image
+                .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
+                .into_rgba32f();
+            let new_dye_buff = self.device.create_buffer_init(&BufferInitDescriptor {
+                label: Some("Dropped Image Buffer"),
+                contents: image.as_bytes(),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("Dropped Image Buffer Copy Encoder"),
+                });
+            encoder.copy_buffer_to_buffer(
+                &new_dye_buff,
+                0,
+                &self.dye_buff,
+                0,
+                image.as_bytes().len() as u64,
+            );
+        }
+    }
+
+    fn handle_window_event(&mut self, event: WindowEvent, window_id: WindowId) -> ControlFlow {
+        if window_id == self.window.id() {
+            match event {
+                WindowEvent::CloseRequested => return ControlFlow::Exit,
+                WindowEvent::Resized(size) => self.resize_surface(size),
+                WindowEvent::CursorMoved {
+                    position,
+                    device_id,
+                    ..
+                } => self.handle_cursor_moved(position, device_id),
+                WindowEvent::MouseInput {
+                    button,
+                    state,
+                    device_id,
+                    ..
+                } => self.handle_mouse_input(button, state, device_id),
+                WindowEvent::DroppedFile(pathbuf) => self.handle_dropped_file(&pathbuf),
+                _ => {}
+            };
+        }
         ControlFlow::Poll
     }
 
@@ -778,13 +807,12 @@ impl App {
                 .handle_event(self.imgui_context.io_mut(), &self.window, &event);
             *control_flow = ControlFlow::Poll;
             match event {
-                Event::WindowEvent {
-                    ref event,
-                    window_id,
-                } if window_id == self.window.id() => *control_flow = self.handle_window_event(event),
+                Event::WindowEvent { event, window_id } => {
+                    *control_flow = self.handle_window_event(event, window_id)
+                }
                 Event::MainEventsCleared => {
                     self.perf_update();
-                    self.update();
+                    self.update(); // move to own thread to fix gnome window drag lag
                     self.render();
                 }
                 _ => {}
