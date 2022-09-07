@@ -136,7 +136,7 @@ struct Imgui {
 }
 
 impl Imgui {
-    fn new(window: &Window, format: TextureFormat, device: &Device, queue: &Queue) -> Self {
+    fn new(window: &Window, gpu: &GPU) -> Self {
         let mut context = imgui::Context::create();
         let mut winit = imgui_winit_support::WinitPlatform::init(&mut context);
         winit.attach_window(
@@ -159,10 +159,10 @@ impl Imgui {
                 }),
             }]);
         let renderer_config = imgui_wgpu::RendererConfig {
-            texture_format: format,
+            texture_format: gpu.surface_config.format,
             ..Default::default()
         };
-        let renderer = imgui_wgpu::Renderer::new(&mut context, device, queue, renderer_config);
+        let renderer = imgui_wgpu::Renderer::new(&mut context, &gpu.device, &gpu.queue, renderer_config);
         Self {
             context,
             renderer,
@@ -174,44 +174,20 @@ impl Imgui {
         self.winit
             .handle_event(self.context.io_mut(), window, event);
     }
-}
 
-struct App {
-    event_loop: Option<EventLoop<()>>,
-    window: Window,
-    wgpu: WGPU,
-    vertex_buffer: Buffer,
-    index_buffer: Buffer,
-    compute_bind_group: BindGroup,
-    compute_pipeline: ComputePipeline,
-    vel_buff: Buffer,
-    vel_tmp_buff: Buffer,
-    dye_buff: Buffer,
-    dye_tmp_buff: Buffer,
-    tmp_buff_0: Buffer,
-    tmp_buff_1: Buffer,
-    texture_layout: ImageDataLayout,
-    texture_size: Extent3d,
-    render_texture: Texture,
-    render_texture_bind_group: BindGroup,
-    vel_render_pipeline: RenderPipeline,
-    dye_render_pipeline: RenderPipeline,
-    sim: Sim,
-    render_mode: bool,
-    imgui: Imgui,
-    input_state: InputState,
-    input_settings: InputSettings,
-    fluid_settings: FluidSettings,
+    fn prepare_frame(&mut self, window: &Window) {
+        self.winit.prepare_frame(self.context.io_mut(), window)
+            .expect("Failed to prepare imgui frame");
+    }
 }
-
-struct WGPU {
+struct GPU {
     surface: Surface,
     surface_config: SurfaceConfiguration,
     device: Device,
     queue: Queue,
 }
 
-impl WGPU {
+impl GPU {
     fn new(window: &Window) -> Self {
         let instance = Instance::new(Backends::PRIMARY);
         let surface = unsafe { instance.create_surface(window) };
@@ -252,75 +228,74 @@ impl WGPU {
         }
     }
 
-    fn imgui(&self, window: &Window) -> Imgui {
-        Imgui::new(window, self.surface_config.format, &self.device, &self.queue)
+    fn create_buffer_init(&self, contents: &[u8], usage: BufferUsages) -> Buffer {
+        self.device.create_buffer_init(&BufferInitDescriptor {
+            label: None, contents, usage,
+        })
     }
+}
+
+struct App {
+    event_loop: Option<EventLoop<()>>,
+    window: Window,
+    gpu: GPU,
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    compute_bind_group: BindGroup,
+    compute_pipeline: ComputePipeline,
+    vel_buff: Buffer,
+    vel_tmp_buff: Buffer,
+    dye_buff: Buffer,
+    dye_tmp_buff: Buffer,
+    tmp_buff_0: Buffer,
+    tmp_buff_1: Buffer,
+    texture_layout: ImageDataLayout,
+    texture_size: Extent3d,
+    render_texture: Texture,
+    render_texture_bind_group: BindGroup,
+    vel_render_pipeline: RenderPipeline,
+    dye_render_pipeline: RenderPipeline,
+    sim: Sim,
+    render_mode: bool,
+    imgui: Imgui,
+    input_state: InputState,
+    input_settings: InputSettings,
+    fluid_settings: FluidSettings,
 }
 
 impl App {
     pub fn new() -> Self {
+        let vec4_zeroes = to_raw(&[(0f32, 0f32, 0f32, 0f32); SIM_SIZE * SIM_SIZE]);
+        let f64_zeroes = to_raw(&[0.0; SIM_SIZE * SIM_SIZE]);
+        let gorilla = image::open("gorilla.png")
+            .expect("No gorilla :(")
+            .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
+            .into_rgba32f();
+
         let event_loop = EventLoop::new();
         let window = WindowBuilder::new()
             .with_title("Fluid")
             .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
             .build(&event_loop)
             .unwrap();
-        let wgpu = WGPU::new(&window);
-        let imgui = wgpu.imgui(&window);
-        // make buffers
-        // TODO move to WGPU
-        let vertex_buffer = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: to_raw(vertex::SCREEN_QUAD_VERTICES),
-            usage: BufferUsages::VERTEX,
-        });
-        let index_buffer = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: to_raw(vertex::SCREEN_QUAD_INDICES),
-            usage: BufferUsages::INDEX,
-        });
-        let vec4_buffer_bytes = to_raw(&[(0f32, 0f32, 0f32, 0f32); SIM_SIZE * SIM_SIZE]);
-        let vel_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("vel_buff"),
-            contents: vec4_buffer_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        });
-        let vel_tmp_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("vel_tmp_buff"),
-            contents: vec4_buffer_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let gorilla = image::open("gorilla.png")
-            .expect("No gorilla :(")
-            .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
-            .into_rgba32f();
-        let dye_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("vel_buff"),
-            contents: gorilla.as_bytes(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-        });
-        let dye_tmp_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("dye_tmp_buff"),
-            contents: vec4_buffer_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let float_buffer_bytes = to_raw(&[0.0; SIM_SIZE * SIM_SIZE]);
-        let tmp_buff_0 = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("tmp_buff_0"),
-            contents: float_buffer_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let tmp_buff_1 = wgpu.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("tmp_buff_1"),
-            contents: float_buffer_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
+        let gpu = GPU::new(&window);
+        let imgui = Imgui::new(&window, &gpu);
+
+        let vertex_buffer = gpu.create_buffer_init(to_raw(vertex::SCREEN_QUAD_VERTICES), BufferUsages::VERTEX);
+        let index_buffer = gpu.create_buffer_init(to_raw(vertex::SCREEN_QUAD_INDICES), BufferUsages::INDEX);
+        let vel_buff = gpu.create_buffer_init(vec4_zeroes, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let vel_tmp_buff = gpu.create_buffer_init(vec4_zeroes, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+        let dye_buff = gpu.create_buffer_init(gorilla.as_bytes(), BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST);
+        let dye_tmp_buff = gpu.create_buffer_init(vec4_zeroes, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+        let tmp_buff_0 = gpu.create_buffer_init(f64_zeroes, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+        let tmp_buff_1 = gpu.create_buffer_init(f64_zeroes, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+
         let texture_size = wgpu::Extent3d {
             width: SIM_SIZE as u32,
             height: SIM_SIZE as u32,
             depth_or_array_layers: 1,
         };
-        let render_texture = wgpu.device.create_texture(&TextureDescriptor {
+        let render_texture = gpu.device.create_texture(&TextureDescriptor {
             label: Some("vel_texture"),
             size: texture_size,
             mip_level_count: 1,
@@ -336,7 +311,7 @@ impl App {
             ),
             rows_per_image: NonZeroU32::new(texture_size.height),
         };
-        let texture_sampler = wgpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        let texture_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -345,16 +320,16 @@ impl App {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let render_shader = wgpu.device.create_shader_module(&ShaderModuleDescriptor {
+        let render_shader = gpu.device.create_shader_module(&ShaderModuleDescriptor {
             label: Some("Render Shader"),
             source: ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
-        let compute_shader = wgpu.device.create_shader_module(&ShaderModuleDescriptor {
+        let compute_shader = gpu.device.create_shader_module(&ShaderModuleDescriptor {
             label: Some("Input Shader"),
             source: ShaderSource::Wgsl(include_str!("fluid.wgsl").into()),
         });
         let compute_bind_group_layout =
-            wgpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            gpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 label: Some("Compute bind group layout"),
                 entries: &[
                     BindGroupLayoutEntry {
@@ -419,7 +394,7 @@ impl App {
                     },
                 ],
             });
-        let compute_bind_group = wgpu.device.create_bind_group(&BindGroupDescriptor {
+        let compute_bind_group = gpu.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Compute Bind Group"),
             layout: &compute_bind_group_layout,
             entries: &[
@@ -453,9 +428,9 @@ impl App {
             stages: ShaderStages::COMPUTE,
             range: 0..std::mem::size_of::<FluidPushConstant>() as u32,
         };
-        let compute_pipeline = wgpu.device.create_compute_pipeline(&ComputePipelineDescriptor {
+        let compute_pipeline = gpu.device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("main pipeline"),
-            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&gpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("main pipeline PipelineLayoutDescriptor"),
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[compute_push_constant_range],
@@ -464,7 +439,7 @@ impl App {
             entry_point: "main",
         });
         let texture_bind_group_layout =
-            wgpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            gpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 entries: &[
                     BindGroupLayoutEntry {
                         binding: 0,
@@ -485,7 +460,7 @@ impl App {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-        let render_texture_bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_texture_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -501,9 +476,9 @@ impl App {
             ],
             label: Some("bind_group"),
         });
-        let vel_render_pipeline = wgpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let vel_render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
-            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&gpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout Descriptor"),
                 bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
@@ -517,7 +492,7 @@ impl App {
                 module: &render_shader,
                 entry_point: "vel_main",
                 targets: &[ColorTargetState {
-                    format: wgpu.surface_config.format,
+                    format: gpu.surface_config.format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 }],
@@ -539,9 +514,9 @@ impl App {
             },
             multiview: None,
         });
-        let dye_render_pipeline = wgpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let dye_render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
-            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&gpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout Descriptor"),
                 bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
@@ -555,7 +530,7 @@ impl App {
                 module: &render_shader,
                 entry_point: "dye_main",
                 targets: &[ColorTargetState {
-                    format: wgpu.surface_config.format,
+                    format: gpu.surface_config.format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 }],
@@ -581,7 +556,7 @@ impl App {
         App {
             event_loop: Some(event_loop),
             window,
-            wgpu,
+            gpu,
             vertex_buffer,
             index_buffer,
             compute_bind_group,
@@ -608,20 +583,17 @@ impl App {
     }
 
     pub fn resize_surface(&mut self, width: u32, height: u32) {
-        self.wgpu.surface_config.width = width;
-        self.wgpu.surface_config.height = height;
-        self.wgpu.surface.configure(&self.wgpu.device, &self.wgpu.surface_config);
+        self.gpu.surface_config.width = width;
+        self.gpu.surface_config.height = height;
+        self.gpu.surface.configure(&self.gpu.device, &self.gpu.surface_config);
     }
 
     fn render(&mut self) {
         let swapchain_texture = self
-            .wgpu.surface
+            .gpu.surface
             .get_current_texture()
             .expect("Failed to obtain next swapchain image");
-        self.imgui
-            .winit
-            .prepare_frame(self.imgui.context.io_mut(), &self.window)
-            .expect("Failed to prepare frame");
+        self.imgui.prepare_frame(&self.window);
         let ui = self.imgui.context.frame();
         {
             imgui::Window::new("Options (Collapsible)")
@@ -680,7 +652,7 @@ impl App {
             .texture
             .create_view(&TextureViewDescriptor::default());
         let mut encoder = self
-            .wgpu.device
+            .gpu.device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
@@ -708,19 +680,19 @@ impl App {
         render_pass.draw_indexed(0..6, 0, 0..1);
         self.imgui
             .renderer
-            .render(ui.render(), &self.wgpu.queue, &self.wgpu.device, &mut render_pass)
+            .render(ui.render(), &self.gpu.queue, &self.gpu.device, &mut render_pass)
             .unwrap();
         drop(render_pass);
-        self.wgpu.queue.submit([encoder.finish()]);
+        self.gpu.queue.submit([encoder.finish()]);
         swapchain_texture.present();
     }
 
     fn push_constant(&self, stage: FluidShaderStage) -> Vec<u8> {
         let force_pos = (
             self.input_state.mouse_pos.0 as i32 * SIM_SIZE as i32
-                / self.wgpu.surface_config.width as i32,
+                / self.gpu.surface_config.width as i32,
             self.input_state.mouse_pos.1 as i32 * SIM_SIZE as i32
-                / self.wgpu.surface_config.height as i32,
+                / self.gpu.surface_config.height as i32,
         );
         let del_len = (self.input_state.mouse_del.0 * self.input_state.mouse_del.0
             + self.input_state.mouse_del.1 * self.input_state.mouse_del.1)
@@ -764,7 +736,7 @@ impl App {
     // TODO: Seperate thread
     fn update(&mut self) {
         let mut encoder = self
-            .wgpu.device
+            .gpu.device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Compute Encoder"),
             });
@@ -812,7 +784,7 @@ impl App {
             },
             self.texture_size,
         );
-        self.wgpu.queue.submit([encoder.finish()]);
+        self.gpu.queue.submit([encoder.finish()]);
     }
 
     fn perf_update(&mut self) {
@@ -853,13 +825,9 @@ impl App {
             let image = image
                 .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
                 .into_rgba32f();
-            let new_dye_buff = self.wgpu.device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("Dropped Image Buffer"),
-                contents: image.as_bytes(),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            });
+            let new_dye_buff = self.gpu.create_buffer_init(image.as_bytes(), BufferUsages::STORAGE | BufferUsages::COPY_SRC);
             let mut encoder = self
-                .wgpu.device
+                .gpu.device
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("Dropped Image Buffer Copy Encoder"),
                 });
