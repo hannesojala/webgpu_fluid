@@ -15,14 +15,14 @@ use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
     Backends, BindGroup, BindGroupDescriptor, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
     BindingType, BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState,
-    ColorWrites, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline,
-    ComputePipelineDescriptor, Device, DeviceDescriptor, Extent3d, Face, Features, FragmentState,
-    FrontFace, ImageCopyBuffer, ImageCopyTexture, ImageDataLayout, IndexFormat, Instance, Limits,
-    MultisampleState, PipelineLayoutDescriptor, PolygonMode, PowerPreference, PresentMode,
-    PrimitiveState, PrimitiveTopology, PushConstantRange, Queue, RenderPipeline,
+    ColorWrites, CommandEncoder, CommandEncoderDescriptor, ComputePass, ComputePassDescriptor,
+    ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor, Extent3d, Face, Features,
+    FragmentState, FrontFace, ImageCopyBuffer, ImageCopyTexture, ImageDataLayout, IndexFormat,
+    Instance, Limits, MultisampleState, PipelineLayoutDescriptor, PolygonMode, PowerPreference,
+    PresentMode, PrimitiveState, PrimitiveTopology, PushConstantRange, Queue, RenderPipeline,
     RequestAdapterOptions, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages,
     Surface, SurfaceConfiguration, Texture, TextureDescriptor, TextureFormat, TextureSampleType,
-    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, ComputePass,
+    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -31,9 +31,8 @@ use winit::{
     window::{Window, WindowBuilder, WindowId},
 };
 
-// TODO: MAKE DYNAMIC & CHANGE-ABLE IN UI
 const WINDOW_SIZE: u32 = 800;
-const SIM_SIZE: usize = 800;
+const SIM_SIZE: usize = 800; // TODO DYNAMICIZE
 const WG_SIZE: usize = 32;
 
 #[repr(C)]
@@ -50,7 +49,7 @@ struct FluidPushConstant {
     push_vel: u32,
 }
 
-enum Stage {
+enum FluidShaderStage {
     AdvectVelocity = 0,
     SwapVelocity = 1,
     VorticityConfinement = 2,
@@ -77,11 +76,11 @@ impl Default for FluidSettings {
 }
 
 struct InputSettings {
+    draw: bool,
+    push: bool,
     push_power: f32,
     draw_size: f32,
     draw_color: [f32; 4],
-    draw_dye: bool,
-    push_vel: bool,
 }
 
 impl Default for InputSettings {
@@ -90,8 +89,24 @@ impl Default for InputSettings {
             push_power: 5.0,
             draw_size: 50.0,
             draw_color: [0.0, 1.0, 0.0, 1.0],
-            draw_dye: true,
-            push_vel: true,
+            draw: true,
+            push: true,
+        }
+    }
+}
+
+struct InputState {
+    mouse_pos: (f64, f64),
+    mouse_del: (f64, f64),
+    mouse_down: bool,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            mouse_pos: (0.0, 0.0),
+            mouse_del: (0.0, 0.0),
+            mouse_down: false,
         }
     }
 }
@@ -117,16 +132,16 @@ impl Default for Sim {
 struct Imgui {
     context: imgui::Context,
     renderer: imgui_wgpu::Renderer,
-    platform: imgui_winit_support::WinitPlatform,
+    winit: imgui_winit_support::WinitPlatform,
 }
 
 impl Imgui {
     fn new(window: &Window, format: TextureFormat, device: &Device, queue: &Queue) -> Self {
         let mut context = imgui::Context::create();
-        let mut platform = imgui_winit_support::WinitPlatform::init(&mut context);
-        platform.attach_window(
+        let mut winit = imgui_winit_support::WinitPlatform::init(&mut context);
+        winit.attach_window(
             context.io_mut(),
-            &window,
+            window,
             imgui_winit_support::HiDpiMode::Default,
         );
         context.set_ini_filename(None);
@@ -147,23 +162,24 @@ impl Imgui {
             texture_format: format,
             ..Default::default()
         };
-        let renderer =
-            imgui_wgpu::Renderer::new(&mut context, device, queue, renderer_config);
+        let renderer = imgui_wgpu::Renderer::new(&mut context, device, queue, renderer_config);
         Self {
             context,
             renderer,
-            platform,
+            winit,
         }
+    }
+
+    fn handle_event<T>(&mut self, event: &Event<T>, window: &Window) {
+        self.winit
+            .handle_event(self.context.io_mut(), window, event);
     }
 }
 
 struct App {
     event_loop: Option<EventLoop<()>>,
     window: Window,
-    surface: Surface,
-    surface_config: SurfaceConfiguration,
-    device: Device,
-    queue: Queue,
+    wgpu: WGPU,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     compute_bind_group: BindGroup,
@@ -183,24 +199,22 @@ struct App {
     sim: Sim,
     render_mode: bool,
     imgui: Imgui,
-    mouse_pos: (f64, f64),
-    mouse_del: (f64, f64),
-    mouse_down: bool,
+    input_state: InputState,
     input_settings: InputSettings,
     fluid_settings: FluidSettings,
 }
 
-impl App {
-    pub fn new() -> Self {
-        let event_loop = EventLoop::new();
-        let window = WindowBuilder::new()
-            .with_title("Fluid")
-            .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
-            // .with_resizable(false)
-            .build(&event_loop)
-            .unwrap();
+struct WGPU {
+    surface: Surface,
+    surface_config: SurfaceConfiguration,
+    device: Device,
+    queue: Queue,
+}
+
+impl WGPU {
+    fn new(window: &Window) -> Self {
         let instance = Instance::new(Backends::PRIMARY);
-        let surface = unsafe { instance.create_surface(&window) };
+        let surface = unsafe { instance.create_surface(window) };
         let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -230,49 +244,73 @@ impl App {
             present_mode: PresentMode::Immediate,
         };
         surface.configure(&device, &surface_config);
-        let imgui = Imgui::new(&window, surface_config.format, &device, &queue);
-        let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        Self {
+            surface,
+            surface_config,
+            device,
+            queue,
+        }
+    }
+
+    fn imgui(&self, window: &Window) -> Imgui {
+        Imgui::new(window, self.surface_config.format, &self.device, &self.queue)
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        let event_loop = EventLoop::new();
+        let window = WindowBuilder::new()
+            .with_title("Fluid")
+            .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
+            .build(&event_loop)
+            .unwrap();
+        let wgpu = WGPU::new(&window);
+        let imgui = wgpu.imgui(&window);
+        // make buffers
+        // TODO move to WGPU
+        let vertex_buffer = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: to_raw(vertex::SCREEN_QUAD_VERTICES),
             usage: BufferUsages::VERTEX,
         });
-        let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        let index_buffer = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Index Buffer"),
             contents: to_raw(vertex::SCREEN_QUAD_INDICES),
             usage: BufferUsages::INDEX,
         });
         let vec4_buffer_bytes = to_raw(&[(0f32, 0f32, 0f32, 0f32); SIM_SIZE * SIM_SIZE]);
-        let vel_buff = device.create_buffer_init(&BufferInitDescriptor {
+        let vel_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: vec4_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
-        let vel_tmp_buff = device.create_buffer_init(&BufferInitDescriptor {
+        let vel_tmp_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_tmp_buff"),
             contents: vec4_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        let gorilla = image::open("gorilla.png").expect("No gorilla :(");
-        let gorilla = gorilla
+        let gorilla = image::open("gorilla.png")
+            .expect("No gorilla :(")
             .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
             .into_rgba32f();
-        let dye_buff = device.create_buffer_init(&BufferInitDescriptor {
+        let dye_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vel_buff"),
             contents: gorilla.as_bytes(),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         });
-        let dye_tmp_buff = device.create_buffer_init(&BufferInitDescriptor {
+        let dye_tmp_buff = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("dye_tmp_buff"),
             contents: vec4_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let float_buffer_bytes = to_raw(&[0.0; SIM_SIZE * SIM_SIZE]);
-        let tmp_buff_0 = device.create_buffer_init(&BufferInitDescriptor {
+        let tmp_buff_0 = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("tmp_buff_0"),
             contents: float_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        let tmp_buff_1 = device.create_buffer_init(&BufferInitDescriptor {
+        let tmp_buff_1 = wgpu.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("tmp_buff_1"),
             contents: float_buffer_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
@@ -282,7 +320,7 @@ impl App {
             height: SIM_SIZE as u32,
             depth_or_array_layers: 1,
         };
-        let render_texture = device.create_texture(&TextureDescriptor {
+        let render_texture = wgpu.device.create_texture(&TextureDescriptor {
             label: Some("vel_texture"),
             size: texture_size,
             mip_level_count: 1,
@@ -298,7 +336,7 @@ impl App {
             ),
             rows_per_image: NonZeroU32::new(texture_size.height),
         };
-        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let texture_sampler = wgpu.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -307,16 +345,16 @@ impl App {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let render_shader = device.create_shader_module(&ShaderModuleDescriptor {
+        let render_shader = wgpu.device.create_shader_module(&ShaderModuleDescriptor {
             label: Some("Render Shader"),
             source: ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
-        let compute_shader = device.create_shader_module(&ShaderModuleDescriptor {
+        let compute_shader = wgpu.device.create_shader_module(&ShaderModuleDescriptor {
             label: Some("Input Shader"),
             source: ShaderSource::Wgsl(include_str!("fluid.wgsl").into()),
         });
         let compute_bind_group_layout =
-            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            wgpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 label: Some("Compute bind group layout"),
                 entries: &[
                     BindGroupLayoutEntry {
@@ -381,7 +419,7 @@ impl App {
                     },
                 ],
             });
-        let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        let compute_bind_group = wgpu.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Compute Bind Group"),
             layout: &compute_bind_group_layout,
             entries: &[
@@ -415,9 +453,9 @@ impl App {
             stages: ShaderStages::COMPUTE,
             range: 0..std::mem::size_of::<FluidPushConstant>() as u32,
         };
-        let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        let compute_pipeline = wgpu.device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("main pipeline"),
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("main pipeline PipelineLayoutDescriptor"),
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[compute_push_constant_range],
@@ -426,7 +464,7 @@ impl App {
             entry_point: "main",
         });
         let texture_bind_group_layout =
-            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            wgpu.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 entries: &[
                     BindGroupLayoutEntry {
                         binding: 0,
@@ -447,7 +485,7 @@ impl App {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-        let render_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_texture_bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -463,9 +501,9 @@ impl App {
             ],
             label: Some("bind_group"),
         });
-        let vel_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let vel_render_pipeline = wgpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout Descriptor"),
                 bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
@@ -479,7 +517,7 @@ impl App {
                 module: &render_shader,
                 entry_point: "vel_main",
                 targets: &[ColorTargetState {
-                    format: surface_config.format,
+                    format: wgpu.surface_config.format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 }],
@@ -501,9 +539,9 @@ impl App {
             },
             multiview: None,
         });
-        let dye_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let dye_render_pipeline = wgpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            layout: Some(&wgpu.device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout Descriptor"),
                 bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
@@ -517,7 +555,7 @@ impl App {
                 module: &render_shader,
                 entry_point: "dye_main",
                 targets: &[ColorTargetState {
-                    format: surface_config.format,
+                    format: wgpu.surface_config.format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 }],
@@ -543,10 +581,7 @@ impl App {
         App {
             event_loop: Some(event_loop),
             window,
-            surface,
-            surface_config,
-            device,
-            queue,
+            wgpu,
             vertex_buffer,
             index_buffer,
             compute_bind_group,
@@ -566,26 +601,25 @@ impl App {
             sim: Sim::default(),
             render_mode: false,
             imgui,
-            mouse_pos: (0.0, 0.0),
-            mouse_del: (0.0, 0.0),
-            mouse_down: false,
+            input_state: InputState::default(),
             input_settings: InputSettings::default(),
             fluid_settings: FluidSettings::default(),
         }
     }
 
-    pub fn resize_surface(&mut self, new_size: PhysicalSize<u32>) {
-        self.surface_config.width = new_size.width;
-        self.surface_config.height = new_size.height;
-        self.surface.configure(&self.device, &self.surface_config);
+    pub fn resize_surface(&mut self, width: u32, height: u32) {
+        self.wgpu.surface_config.width = width;
+        self.wgpu.surface_config.height = height;
+        self.wgpu.surface.configure(&self.wgpu.device, &self.wgpu.surface_config);
     }
 
     fn render(&mut self) {
         let swapchain_texture = self
-            .surface
+            .wgpu.surface
             .get_current_texture()
             .expect("Failed to obtain next swapchain image");
-        self.imgui.platform
+        self.imgui
+            .winit
             .prepare_frame(self.imgui.context.io_mut(), &self.window)
             .expect("Failed to prepare frame");
         let ui = self.imgui.context.frame();
@@ -605,8 +639,8 @@ impl App {
                         ui.separator();
 
                         ui.text("Mouse Action");
-                        ui.checkbox("Push Fluid", &mut self.input_settings.push_vel);
-                        ui.checkbox("Drop Dye", &mut self.input_settings.draw_dye);
+                        ui.checkbox("Push Fluid", &mut self.input_settings.push);
+                        ui.checkbox("Drop Dye", &mut self.input_settings.draw);
                         ui.separator();
 
                         ui.text("Input");
@@ -618,7 +652,8 @@ impl App {
                         imgui::Slider::new("Push Strength", 0.0, 10.0)
                             .display_format("%.2f")
                             .build(&ui, &mut self.input_settings.push_power);
-                        imgui::ColorPicker::new("Dye Color", &mut self.input_settings.draw_color).build(&ui);
+                        imgui::ColorPicker::new("Dye Color", &mut self.input_settings.draw_color)
+                            .build(&ui);
                         ui.separator();
                         ui.text_wrapped("Try dragging and dropping a png into this window!");
 
@@ -640,12 +675,12 @@ impl App {
                     });
                 });
         }
-        self.imgui.platform.prepare_render(&ui, &self.window);
+        self.imgui.winit.prepare_render(&ui, &self.window);
         let swapchain_texture_view = swapchain_texture
             .texture
             .create_view(&TextureViewDescriptor::default());
         let mut encoder = self
-            .device
+            .wgpu.device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
@@ -671,24 +706,30 @@ impl App {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
         render_pass.draw_indexed(0..6, 0, 0..1);
-        self.imgui.renderer
-            .render(ui.render(), &self.queue, &self.device, &mut render_pass)
+        self.imgui
+            .renderer
+            .render(ui.render(), &self.wgpu.queue, &self.wgpu.device, &mut render_pass)
             .unwrap();
         drop(render_pass);
-        self.queue.submit([encoder.finish()]);
+        self.wgpu.queue.submit([encoder.finish()]);
         swapchain_texture.present();
     }
 
-    fn push_constant(&self, stage: Stage) -> Vec<u8> {
+    fn push_constant(&self, stage: FluidShaderStage) -> Vec<u8> {
         let force_pos = (
-            self.mouse_pos.0 as i32 * SIM_SIZE as i32 / self.surface_config.width as i32,
-            self.mouse_pos.1 as i32 * SIM_SIZE as i32 / self.surface_config.height as i32,
+            self.input_state.mouse_pos.0 as i32 * SIM_SIZE as i32
+                / self.wgpu.surface_config.width as i32,
+            self.input_state.mouse_pos.1 as i32 * SIM_SIZE as i32
+                / self.wgpu.surface_config.height as i32,
         );
-        let del_len =
-            (self.mouse_del.0 * self.mouse_del.0 + self.mouse_del.1 * self.mouse_del.1).sqrt();
+        let del_len = (self.input_state.mouse_del.0 * self.input_state.mouse_del.0
+            + self.input_state.mouse_del.1 * self.input_state.mouse_del.1)
+            .sqrt();
         let force_dir = (
-            self.input_settings.push_power * (del_len * del_len * self.mouse_del.0) as f32,
-            self.input_settings.push_power * (del_len * del_len * self.mouse_del.1) as f32,
+            self.input_settings.push_power
+                * (del_len * del_len * self.input_state.mouse_del.0) as f32,
+            self.input_settings.push_power
+                * (del_len * del_len * self.input_state.mouse_del.1) as f32,
         );
         let over_ui = self.imgui.context.io().want_capture_mouse;
         to_raw(&[FluidPushConstant {
@@ -700,8 +741,8 @@ impl App {
             dt_s: Duration::from_millis(self.sim.timestep_ms).as_secs_f32(),
             vort: self.fluid_settings.vort,
             stage: stage as u32,
-            draw_dye: (!over_ui && self.input_settings.draw_dye && self.mouse_down) as u32,
-            push_vel: (!over_ui && self.input_settings.push_vel && self.mouse_down) as u32,
+            draw_dye: (!over_ui && self.input_settings.draw && self.input_state.mouse_down) as u32,
+            push_vel: (!over_ui && self.input_settings.push && self.input_state.mouse_down) as u32,
         }])
         .to_owned()
     }
@@ -713,7 +754,7 @@ impl App {
         encoder.clear_buffer(&self.tmp_buff_1, 0, None);
     }
 
-    fn dispatch_stage(&self, compute_pass: &mut ComputePass, stage: Stage) {
+    fn dispatch_stage(&self, compute_pass: &mut ComputePass, stage: FluidShaderStage) {
         let (dispatch_x, dispatch_y) =
             util::dispatch_size((SIM_SIZE, SIM_SIZE), (WG_SIZE, WG_SIZE));
         compute_pass.set_push_constants(0, &self.push_constant(stage));
@@ -723,7 +764,7 @@ impl App {
     // TODO: Seperate thread
     fn update(&mut self) {
         let mut encoder = self
-            .device
+            .wgpu.device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Compute Encoder"),
             });
@@ -738,18 +779,18 @@ impl App {
             // todo: move loop to outer function
             while self.sim.accum_time > Duration::from_millis(self.sim.timestep_ms) {
                 self.sim.accum_time -= Duration::from_millis(self.sim.timestep_ms);
-                self.dispatch_stage(&mut compute_pass, Stage::Input);
-                self.dispatch_stage(&mut compute_pass, Stage::AdvectVelocity);
-                self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
-                self.dispatch_stage(&mut compute_pass, Stage::VorticityConfinement);
-                self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::Input);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::AdvectVelocity);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::SwapVelocity);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::VorticityConfinement);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::SwapVelocity);
                 for _ in 0..self.fluid_settings.qual {
-                    self.dispatch_stage(&mut compute_pass, Stage::Project);
-                    self.dispatch_stage(&mut compute_pass, Stage::SwapTmp);
+                    self.dispatch_stage(&mut compute_pass, FluidShaderStage::Project);
+                    self.dispatch_stage(&mut compute_pass, FluidShaderStage::SwapTmp);
                 }
-                self.dispatch_stage(&mut compute_pass, Stage::RemoveDivergence);
-                self.dispatch_stage(&mut compute_pass, Stage::AdvectDye);
-                self.dispatch_stage(&mut compute_pass, Stage::SwapDye);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::RemoveDivergence);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::AdvectDye);
+                self.dispatch_stage(&mut compute_pass, FluidShaderStage::SwapDye);
             }
         }
         // todo: Move out of update
@@ -771,21 +812,25 @@ impl App {
             },
             self.texture_size,
         );
-        self.queue.submit([encoder.finish()]);
+        self.wgpu.queue.submit([encoder.finish()]);
     }
 
     fn perf_update(&mut self) {
         self.sim.elapsed_time = self.sim.current_time.elapsed();
         self.sim.current_time = Instant::now();
         self.sim.accum_time += self.sim.elapsed_time;
-        self.imgui.context
+        self.imgui
+            .context
             .io_mut()
             .update_delta_time(self.sim.elapsed_time);
     }
 
     fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>, _device_id: DeviceId) {
-        self.mouse_del = (position.x - self.mouse_pos.0, position.y - self.mouse_pos.1);
-        self.mouse_pos = (position.x, position.y);
+        self.input_state.mouse_del = (
+            position.x - self.input_state.mouse_pos.0,
+            position.y - self.input_state.mouse_pos.1,
+        );
+        self.input_state.mouse_pos = (position.x, position.y);
     }
 
     fn handle_mouse_input(
@@ -795,7 +840,9 @@ impl App {
         _device_id: DeviceId,
     ) {
         match button {
-            winit::event::MouseButton::Left => self.mouse_down = state == ElementState::Pressed,
+            winit::event::MouseButton::Left => {
+                self.input_state.mouse_down = state == ElementState::Pressed
+            }
             _ => {}
         }
     }
@@ -806,13 +853,13 @@ impl App {
             let image = image
                 .resize_exact(SIM_SIZE as u32, SIM_SIZE as u32, FilterType::Nearest)
                 .into_rgba32f();
-            let new_dye_buff = self.device.create_buffer_init(&BufferInitDescriptor {
+            let new_dye_buff = self.wgpu.device.create_buffer_init(&BufferInitDescriptor {
                 label: Some("Dropped Image Buffer"),
                 contents: image.as_bytes(),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             });
             let mut encoder = self
-                .device
+                .wgpu.device
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("Dropped Image Buffer Copy Encoder"),
                 });
@@ -830,7 +877,7 @@ impl App {
         if window_id == self.window.id() {
             match event {
                 WindowEvent::CloseRequested => return ControlFlow::Exit,
-                WindowEvent::Resized(size) => self.resize_surface(size),
+                WindowEvent::Resized(size) => self.resize_surface(size.width, size.height),
                 WindowEvent::CursorMoved {
                     position,
                     device_id,
@@ -852,9 +899,8 @@ impl App {
     fn run(mut self) {
         let handler = self.event_loop.take().unwrap();
         handler.run(move |event, _, control_flow| {
-            self.imgui.platform
-                .handle_event(self.imgui.context.io_mut(), &self.window, &event);
             *control_flow = ControlFlow::Poll;
+            self.imgui.handle_event(&event, &self.window);
             match event {
                 Event::WindowEvent { event, window_id } => {
                     *control_flow = self.handle_window_event(event, window_id)
