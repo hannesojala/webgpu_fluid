@@ -35,7 +35,6 @@ use winit::{
 const WINDOW_SIZE: u32 = 800;
 const SIM_SIZE: usize = 800;
 const WG_SIZE: usize = 32;
-const TARGET_FRAME_TIME: Duration = Duration::from_millis(1000/144);
 
 #[repr(C)]
 struct FluidPushConstant {
@@ -63,6 +62,101 @@ enum Stage {
     SwapDye = 8,
 }
 
+struct FluidSettings {
+    vort: f32,
+    qual: u32,
+}
+
+impl Default for FluidSettings {
+    fn default() -> Self {
+        Self {
+            vort: 5.0,
+            qual: 100,
+        }
+    }
+}
+
+struct InputSettings {
+    push_power: f32,
+    draw_size: f32,
+    draw_color: [f32; 4],
+    draw_dye: bool,
+    push_vel: bool,
+}
+
+impl Default for InputSettings {
+    fn default() -> Self {
+        Self {
+            push_power: 5.0,
+            draw_size: 50.0,
+            draw_color: [0.0, 1.0, 0.0, 1.0],
+            draw_dye: true,
+            push_vel: true,
+        }
+    }
+}
+
+struct Sim {
+    timestep_ms: u64, // controlled by UI, converted to Duration for use
+    current_time: Instant,
+    accum_time: Duration,
+    elapsed_time: Duration,
+}
+
+impl Default for Sim {
+    fn default() -> Self {
+        Self {
+            timestep_ms: 1000 / 60,
+            current_time: Instant::now(),
+            accum_time: Duration::ZERO,
+            elapsed_time: Duration::ZERO,
+        }
+    }
+}
+
+struct Imgui {
+    context: imgui::Context,
+    renderer: imgui_wgpu::Renderer,
+    platform: imgui_winit_support::WinitPlatform,
+}
+
+impl Imgui {
+    fn new(window: &Window, format: TextureFormat, device: &Device, queue: &Queue) -> Self {
+        let mut context = imgui::Context::create();
+        let mut platform = imgui_winit_support::WinitPlatform::init(&mut context);
+        platform.attach_window(
+            context.io_mut(),
+            &window,
+            imgui_winit_support::HiDpiMode::Default,
+        );
+        context.set_ini_filename(None);
+        let hidpi_factor = window.scale_factor();
+        let font_size = (13.0 * hidpi_factor) as f32;
+        context.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+        context
+            .fonts()
+            .add_font(&[imgui::FontSource::DefaultFontData {
+                config: Some(imgui::FontConfig {
+                    oversample_h: 1,
+                    pixel_snap_h: true,
+                    size_pixels: font_size,
+                    ..Default::default()
+                }),
+            }]);
+        let renderer_config = imgui_wgpu::RendererConfig {
+            texture_format: format,
+            ..Default::default()
+        };
+        let renderer =
+            imgui_wgpu::Renderer::new(&mut context, device, queue, renderer_config);
+        Self {
+            context,
+            renderer,
+            platform,
+        }
+    }
+}
+
 struct App {
     event_loop: Option<EventLoop<()>>,
     window: Window,
@@ -86,24 +180,14 @@ struct App {
     render_texture_bind_group: BindGroup,
     vel_render_pipeline: RenderPipeline,
     dye_render_pipeline: RenderPipeline,
-    timestep_ms: u64, // controlled by UI, converted to Duration for use
-    current_time: Instant,
-    accum_time: Duration,
-    elapsed_time: Duration,
+    sim: Sim,
     render_mode: bool,
-    imgui_context: imgui::Context,
-    imgui_renderer: imgui_wgpu::Renderer,
-    imgui_platform: imgui_winit_support::WinitPlatform,
+    imgui: Imgui,
     mouse_pos: (f64, f64),
     mouse_del: (f64, f64),
     mouse_down: bool,
-    push_power: f32,
-    draw_size: f32,
-    draw_color: [f32; 4],
-    draw_dye: bool,
-    push_vel: bool,
-    vort: f32,
-    qual: u32,
+    input_settings: InputSettings,
+    fluid_settings: FluidSettings,
 }
 
 impl App {
@@ -112,7 +196,7 @@ impl App {
         let window = WindowBuilder::new()
             .with_title("Fluid")
             .with_inner_size(PhysicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
-            .with_resizable(false)
+            // .with_resizable(false)
             .build(&event_loop)
             .unwrap();
         let instance = Instance::new(Backends::PRIMARY);
@@ -146,33 +230,7 @@ impl App {
             present_mode: PresentMode::Immediate,
         };
         surface.configure(&device, &surface_config);
-        let mut imgui = imgui::Context::create();
-        let mut imgui_platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
-        imgui_platform.attach_window(
-            imgui.io_mut(),
-            &window,
-            imgui_winit_support::HiDpiMode::Default,
-        );
-        imgui.set_ini_filename(None);
-        let hidpi_factor = window.scale_factor();
-        let font_size = (13.0 * hidpi_factor) as f32;
-        imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        imgui
-            .fonts()
-            .add_font(&[imgui::FontSource::DefaultFontData {
-                config: Some(imgui::FontConfig {
-                    oversample_h: 1,
-                    pixel_snap_h: true,
-                    size_pixels: font_size,
-                    ..Default::default()
-                }),
-            }]);
-        let imgui_renderer_config = imgui_wgpu::RendererConfig {
-            texture_format: surface_config.format,
-            ..Default::default()
-        };
-        let imgui_renderer =
-            imgui_wgpu::Renderer::new(&mut imgui, &device, &queue, imgui_renderer_config);
+        let imgui = Imgui::new(&window, surface_config.format, &device, &queue);
         let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: to_raw(vertex::SCREEN_QUAD_VERTICES),
@@ -505,24 +563,14 @@ impl App {
             render_texture_bind_group,
             vel_render_pipeline,
             dye_render_pipeline,
-            timestep_ms: 1000 / 60,
-            current_time: Instant::now(),
-            accum_time: Duration::ZERO,
-            elapsed_time: Duration::ZERO,
+            sim: Sim::default(),
             render_mode: false,
-            imgui_context: imgui,
-            imgui_renderer,
-            imgui_platform,
+            imgui,
             mouse_pos: (0.0, 0.0),
             mouse_del: (0.0, 0.0),
             mouse_down: false,
-            push_power: 5.0,
-            draw_size: 50.0,
-            draw_color: [0.0, 1.0, 0.0, 1.0],
-            draw_dye: true,
-            push_vel: true,
-            vort: 5.0,
-            qual: 100,
+            input_settings: InputSettings::default(),
+            fluid_settings: FluidSettings::default(),
         }
     }
 
@@ -537,10 +585,10 @@ impl App {
             .surface
             .get_current_texture()
             .expect("Failed to obtain next swapchain image");
-        self.imgui_platform
-            .prepare_frame(self.imgui_context.io_mut(), &self.window)
+        self.imgui.platform
+            .prepare_frame(self.imgui.context.io_mut(), &self.window)
             .expect("Failed to prepare frame");
-        let ui = self.imgui_context.frame();
+        let ui = self.imgui.context.frame();
         {
             imgui::Window::new("Options (Collapsible)")
                 .collapsed(true, imgui::Condition::FirstUseEver)
@@ -557,20 +605,20 @@ impl App {
                         ui.separator();
 
                         ui.text("Mouse Action");
-                        ui.checkbox("Push Fluid", &mut self.push_vel);
-                        ui.checkbox("Drop Dye", &mut self.draw_dye);
+                        ui.checkbox("Push Fluid", &mut self.input_settings.push_vel);
+                        ui.checkbox("Drop Dye", &mut self.input_settings.draw_dye);
                         ui.separator();
 
                         ui.text("Input");
                         ui.set_next_item_width(-100.0);
                         imgui::Slider::new("Draw Size", 0.0, 100.0)
                             .display_format("%.2f")
-                            .build(&ui, &mut self.draw_size);
+                            .build(&ui, &mut self.input_settings.draw_size);
                         ui.set_next_item_width(-100.0);
                         imgui::Slider::new("Push Strength", 0.0, 10.0)
                             .display_format("%.2f")
-                            .build(&ui, &mut self.push_power);
-                        imgui::ColorPicker::new("Dye Color", &mut self.draw_color).build(&ui);
+                            .build(&ui, &mut self.input_settings.push_power);
+                        imgui::ColorPicker::new("Dye Color", &mut self.input_settings.draw_color).build(&ui);
                         ui.separator();
                         ui.text_wrapped("Try dragging and dropping a png into this window!");
 
@@ -578,21 +626,21 @@ impl App {
                         ui.set_next_item_width(-100.0);
                         imgui::Slider::new("Vorticity", 0.0, 5.0)
                             .display_format("%.2f")
-                            .build(&ui, &mut self.vort);
+                            .build(&ui, &mut self.fluid_settings.vort);
                         ui.separator();
 
                         imgui::Slider::new("Quality", 5, 150)
                             .display_format("%d")
-                            .build(&ui, &mut self.qual);
+                            .build(&ui, &mut self.fluid_settings.qual);
                         imgui::Slider::new("Timestep (ms)", 1, 100)
                             .display_format("%d")
-                            .build(&ui, &mut self.timestep_ms);
+                            .build(&ui, &mut self.sim.timestep_ms);
 
                         ui.text_wrapped("Upcoming features: Pressure Poisson, more sliders");
                     });
                 });
         }
-        self.imgui_platform.prepare_render(&ui, &self.window);
+        self.imgui.platform.prepare_render(&ui, &self.window);
         let swapchain_texture_view = swapchain_texture
             .texture
             .create_view(&TextureViewDescriptor::default());
@@ -623,7 +671,7 @@ impl App {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint32);
         render_pass.draw_indexed(0..6, 0, 0..1);
-        self.imgui_renderer
+        self.imgui.renderer
             .render(ui.render(), &self.queue, &self.device, &mut render_pass)
             .unwrap();
         drop(render_pass);
@@ -639,21 +687,21 @@ impl App {
         let del_len =
             (self.mouse_del.0 * self.mouse_del.0 + self.mouse_del.1 * self.mouse_del.1).sqrt();
         let force_dir = (
-            self.push_power * (del_len * del_len * self.mouse_del.0) as f32,
-            self.push_power * (del_len * del_len * self.mouse_del.1) as f32,
+            self.input_settings.push_power * (del_len * del_len * self.mouse_del.0) as f32,
+            self.input_settings.push_power * (del_len * del_len * self.mouse_del.1) as f32,
         );
-        let over_ui = self.imgui_context.io().want_capture_mouse;
+        let over_ui = self.imgui.context.io().want_capture_mouse;
         to_raw(&[FluidPushConstant {
-            draw_color: self.draw_color,
+            draw_color: self.input_settings.draw_color,
             dimension: (SIM_SIZE as u32, SIM_SIZE as u32),
             force_pos,
             force_dir,
-            draw_size: self.draw_size,
-            dt_s: Duration::from_millis(self.timestep_ms).as_secs_f32(),
-            vort: self.vort,
+            draw_size: self.input_settings.draw_size,
+            dt_s: Duration::from_millis(self.sim.timestep_ms).as_secs_f32(),
+            vort: self.fluid_settings.vort,
             stage: stage as u32,
-            draw_dye: (!over_ui && self.draw_dye && self.mouse_down) as u32,
-            push_vel: (!over_ui && self.push_vel && self.mouse_down) as u32,
+            draw_dye: (!over_ui && self.input_settings.draw_dye && self.mouse_down) as u32,
+            push_vel: (!over_ui && self.input_settings.push_vel && self.mouse_down) as u32,
         }])
         .to_owned()
     }
@@ -686,15 +734,16 @@ impl App {
             });
             compute_pass.set_pipeline(&self.compute_pipeline);
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            self.dispatch_stage(&mut compute_pass, Stage::Input);
+            // FUCK theres a synchro bug somewhere. Resize to reproduce
             // todo: move loop to outer function
-            while self.accum_time > Duration::from_millis(self.timestep_ms) {
-                self.accum_time -= Duration::from_millis(self.timestep_ms);
+            while self.sim.accum_time > Duration::from_millis(self.sim.timestep_ms) {
+                self.sim.accum_time -= Duration::from_millis(self.sim.timestep_ms);
+                self.dispatch_stage(&mut compute_pass, Stage::Input);
                 self.dispatch_stage(&mut compute_pass, Stage::AdvectVelocity);
                 self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
                 self.dispatch_stage(&mut compute_pass, Stage::VorticityConfinement);
                 self.dispatch_stage(&mut compute_pass, Stage::SwapVelocity);
-                for _ in 0..self.qual {
+                for _ in 0..self.fluid_settings.qual {
                     self.dispatch_stage(&mut compute_pass, Stage::Project);
                     self.dispatch_stage(&mut compute_pass, Stage::SwapTmp);
                 }
@@ -726,12 +775,12 @@ impl App {
     }
 
     fn perf_update(&mut self) {
-        self.elapsed_time = self.current_time.elapsed();
-        self.current_time = Instant::now();
-        self.accum_time += self.elapsed_time;
-        self.imgui_context
+        self.sim.elapsed_time = self.sim.current_time.elapsed();
+        self.sim.current_time = Instant::now();
+        self.sim.accum_time += self.sim.elapsed_time;
+        self.imgui.context
             .io_mut()
-            .update_delta_time(self.elapsed_time);
+            .update_delta_time(self.sim.elapsed_time);
     }
 
     fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>, _device_id: DeviceId) {
@@ -803,8 +852,8 @@ impl App {
     fn run(mut self) {
         let handler = self.event_loop.take().unwrap();
         handler.run(move |event, _, control_flow| {
-            self.imgui_platform
-                .handle_event(self.imgui_context.io_mut(), &self.window, &event);
+            self.imgui.platform
+                .handle_event(self.imgui.context.io_mut(), &self.window, &event);
             *control_flow = ControlFlow::Poll;
             match event {
                 Event::WindowEvent { event, window_id } => {
